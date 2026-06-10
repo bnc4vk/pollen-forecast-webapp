@@ -345,19 +345,27 @@ function PollenMap({
       <div ref={mapNode} className="leaflet-host" />
       <div className="map-legend" aria-label="Pollen overlay legend">
         <div>
-          <p className="toolbar-label">{categoryLabel(selectedCategory)} map layer</p>
+          <p className="toolbar-label">{categoryLabel(selectedCategory)} allergy score</p>
           <p className="toolbar-value">
-            {selectedCategoryData ? `${selectedCategoryData.score}/100 ensemble score` : 'Waiting for score'}
+            {selectedCategoryData ? `${selectedCategoryData.score}/100` : 'Waiting for score'}
+          </p>
+          <p className="legend-note">
+            Your allergy score uses all available forecast sources.
           </p>
           <p className="legend-meta">
             {gridLoading || !gridIsCurrent
               ? 'Updating map layer...'
               : gridIsFlatZero && hasEnsembleScore
-                ? 'No raw CAMS concentration mapped; score includes other provider signals.'
+                ? `No map color is shown because we do not have a raw ${categoryLabel(selectedCategory).toLowerCase()} pollen amount for this area. The score is still available from another forecast source.`
                 : gridData
-                  ? `Map range ${gridData.min}-${gridData.max} ${gridData.units}`
+                  ? `Map color range: ${gridData.min}-${gridData.max} ${gridData.units}`
                   : 'No concentration grid'}
           </p>
+          {gridData && !gridIsFlatZero && gridIsCurrent && (
+            <p className="legend-note">
+              This is the estimated pollen amount in the air. It is separate from the 0-100 allergy score.
+            </p>
+          )}
         </div>
         <span className={`legend-ramp ${gridIsFlatZero ? 'flat' : ''}`} aria-hidden="true" />
       </div>
@@ -376,6 +384,7 @@ function scoreLabel(score) {
 
 function ForecastSnapshot({ forecast, loading, error, selectedCategory }) {
   const [expanded, setExpanded] = useState(false);
+  const [sourcesExpanded, setSourcesExpanded] = useState(false);
   const aggregate = forecast?.ensemble?.aggregate;
   const selected = forecast?.ensemble?.[selectedCategory] || aggregate;
   const providers = forecast?.providers || [];
@@ -393,44 +402,69 @@ function ForecastSnapshot({ forecast, loading, error, selectedCategory }) {
           {error
             ? error
             : selected
-              ? `${selected.score}/100 ensemble score from ${selected.signalCount} contributing signals`
+              ? `${selected.score}/100 allergy score from ${selected.signalCount} data source${selected.signalCount === 1 ? '' : 's'}`
               : 'Move the map or enable location to request a forecast.'}
         </p>
+        {selected && (
+          <p className="score-note">
+            The score is a normalized 0-100 estimate. Map colors show a raw pollen amount when one is available
+            for this area.
+          </p>
+        )}
         {selected && aggregate && selected.key !== 'aggregate' && (
           <p className="overall-note">
             Overall all-pollen forecast: {aggregate.score}/100, {scoreLabel(aggregate.score).toLowerCase()}.
           </p>
         )}
       </div>
-      <div className="provider-row" aria-label="Provider status">
-        {providers.length === 0 && (
-          <div className="provider-pill pending">
-            <Database size={16} />
-            <span>Providers pending</span>
+      <button
+        className={`sources-toggle ${sourcesExpanded ? 'expanded' : ''}`}
+        type="button"
+        onClick={() => setSourcesExpanded((value) => !value)}
+        aria-expanded={sourcesExpanded}
+      >
+        <span>
+          <strong>Data sources</strong>
+          <small>
+            {providers.length
+              ? `${okProviders}/${providers.length} currently contributing`
+              : 'Loading source status'}
+          </small>
+        </span>
+        <ChevronDown size={18} />
+      </button>
+      {sourcesExpanded && (
+        <>
+          <div className="provider-row" aria-label="Provider status">
+            {providers.length === 0 && (
+              <div className="provider-pill pending">
+                <Database size={16} />
+                <span>Providers pending</span>
+              </div>
+            )}
+            {providers.map((provider) => (
+              <div className={`provider-pill ${provider.status}`} key={provider.id} title={provider.notes?.join(' ')}>
+                <Database size={16} />
+                <span>{provider.name}</span>
+                <strong>{provider.status}</strong>
+              </div>
+            ))}
           </div>
-        )}
-        {providers.map((provider) => (
-          <div className={`provider-pill ${provider.status}`} key={provider.id} title={provider.notes?.join(' ')}>
-            <Database size={16} />
-            <span>{provider.name}</span>
-            <strong>{provider.status}</strong>
-          </div>
-        ))}
-      </div>
-      {forecast && (
-        <p className="snapshot-footnote">
-          {okProviders}/{providers.length} providers currently contribute; categories are generated from provider
-          data present at this map center.
-        </p>
-      )}
-      {providerIssues.length > 0 && (
-        <div className="provider-issues" aria-label="Provider issues">
-          {providerIssues.map((provider) => (
-            <p key={provider.id}>
-              <strong>{provider.name}:</strong> {provider.error || provider.notes?.[0] || provider.status}
+          {forecast && (
+            <p className="snapshot-footnote">
+              Categories are generated from provider data present at this map center.
             </p>
-          ))}
-        </div>
+          )}
+          {providerIssues.length > 0 && (
+            <div className="provider-issues" aria-label="Provider issues">
+              {providerIssues.map((provider) => (
+                <p key={provider.id}>
+                  <strong>{provider.name}:</strong> {provider.error || provider.notes?.[0] || provider.status}
+                </p>
+              ))}
+            </div>
+          )}
+        </>
       )}
       <button
         className={`ensemble-toggle ${expanded ? 'expanded' : ''}`}

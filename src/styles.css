@@ -300,7 +300,7 @@ h1 {
   z-index: 500;
   right: 12px;
   bottom: 18px;
-  width: min(270px, calc(100% - 92px));
+  width: min(330px, calc(100% - 92px));
   padding: 10px 11px;
   border: 1px solid rgba(220, 227, 214, 0.9);
   border-radius: 8px;
@@ -321,12 +321,18 @@ h1 {
   background: #dfe6da;
 }
 
-.legend-meta {
+.legend-meta,
+.legend-note {
   margin: 4px 0 0;
   color: #657168;
   font-size: 0.78rem;
   font-weight: 750;
   line-height: 1.25;
+}
+
+.legend-note {
+  color: #78827a;
+  font-weight: 650;
 }
 
 .forecast-snapshot {
@@ -361,10 +367,15 @@ h1 {
   line-height: 1.35;
 }
 
-.snapshot-primary .overall-note {
+.snapshot-primary .overall-note,
+.snapshot-primary .score-note {
   color: #6a746c;
   font-size: 0.82rem;
   font-weight: 750;
+}
+
+.snapshot-primary .score-note {
+  font-weight: 650;
 }
 
 .provider-row {
@@ -430,9 +441,9 @@ h1 {
   margin: 0;
 }
 
-.ensemble-toggle {
+.ensemble-toggle,
+.sources-toggle {
   appearance: none;
-  grid-column: 1 / -1;
   min-height: 58px;
   display: flex;
   align-items: center;
@@ -448,29 +459,43 @@ h1 {
   text-align: left;
 }
 
-.ensemble-toggle:hover {
+.ensemble-toggle {
+  grid-column: 1 / -1;
+}
+
+.sources-toggle {
+  min-height: 54px;
+}
+
+.ensemble-toggle:hover,
+.sources-toggle:hover {
   border-color: #9fb3a8;
 }
 
-.ensemble-toggle svg {
+.ensemble-toggle svg,
+.sources-toggle svg {
   flex: 0 0 auto;
   transition: transform 160ms ease;
 }
 
-.ensemble-toggle.expanded svg {
+.ensemble-toggle.expanded svg,
+.sources-toggle.expanded svg {
   transform: rotate(180deg);
 }
 
-.ensemble-toggle span {
+.ensemble-toggle span,
+.sources-toggle span {
   display: grid;
   gap: 3px;
 }
 
-.ensemble-toggle strong {
+.ensemble-toggle strong,
+.sources-toggle strong {
   font-size: 0.95rem;
 }
 
-.ensemble-toggle small {
+.ensemble-toggle small,
+.sources-toggle small {
   color: #657168;
   font-size: 0.82rem;
   font-weight: 750;
