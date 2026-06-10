@@ -42,3 +42,26 @@ VITE_API_BASE_URL=https://your-api.example.com
 ```
 
 Do not embed Google or Tomorrow.io API keys into the Vite bundle unless they are intentionally browser-public and locked down by provider-side restrictions.
+
+## Cloudflare Worker API
+
+This repo includes a Cloudflare Worker API at `worker/index.js`. It exposes:
+
+- `GET /api/health`
+- `GET /api/forecast?lat=51.5074&lng=-0.1278`
+- `GET /api/grid?north=51.7&south=51.3&east=0.15&west=-0.35&category=aggregate`
+
+Deploy it with:
+
+```bash
+npm run worker:deploy
+```
+
+Set provider secrets with Wrangler:
+
+```bash
+npx wrangler secret put GOOGLE_POLLEN_API_KEY
+npx wrangler secret put TOMORROW_API_KEY
+```
+
+After deployment, set `VITE_API_BASE_URL` in the Pages build to the Worker URL.

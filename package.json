@@ -9,7 +9,9 @@
     "dev:server": "node --watch server/index.js",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "start": "node server/index.js"
+    "start": "node server/index.js",
+    "worker:dev": "wrangler dev",
+    "worker:deploy": "wrangler deploy"
   },
   "keywords": [],
   "author": "",
@@ -28,5 +30,8 @@
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "vite": "^6.4.3"
+  },
+  "devDependencies": {
+    "wrangler": "^4.99.0"
   }
 }

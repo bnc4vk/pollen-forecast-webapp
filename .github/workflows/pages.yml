@@ -37,7 +37,7 @@ jobs:
         run: npm run build
         env:
           VITE_BASE_PATH: /pollen-forecast-webapp/
-          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          VITE_API_BASE_URL: https://pollen-forecast-api.bnc4vk-pollen.workers.dev
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
