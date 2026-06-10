@@ -163,13 +163,24 @@ function useUserLocation() {
   return { location, requestLocation };
 }
 
-function PollenMap({ location, onCenterChange, onBoundsChange, selectedCategory, gridData, gridLoading }) {
+function PollenMap({
+  location,
+  onCenterChange,
+  onBoundsChange,
+  selectedCategory,
+  selectedCategoryData,
+  gridData,
+  gridLoading,
+}) {
   const mapNode = useRef(null);
   const mapRef = useRef(null);
   const markerRef = useRef(null);
   const accuracyRef = useRef(null);
   const overlayRef = useRef(null);
   const [center, setCenter] = useState(location);
+  const gridIsCurrent = gridData?.category === selectedCategory;
+  const gridIsFlatZero = gridIsCurrent && gridData && gridData.min === 0 && gridData.max === 0;
+  const hasEnsembleScore = Number(selectedCategoryData?.score) > 0;
 
   useEffect(() => {
     if (!mapNode.current || mapRef.current) return;
@@ -254,7 +265,7 @@ function PollenMap({ location, onCenterChange, onBoundsChange, selectedCategory,
       overlayRef.current = null;
     }
 
-    if (!gridData?.points?.length) return;
+    if (!gridData?.points?.length || gridData.max <= 0) return;
 
     const PollenLayer = L.Layer.extend({
       onAdd(activeMap) {
@@ -334,12 +345,21 @@ function PollenMap({ location, onCenterChange, onBoundsChange, selectedCategory,
       <div ref={mapNode} className="leaflet-host" />
       <div className="map-legend" aria-label="Pollen overlay legend">
         <div>
-          <p className="toolbar-label">{gridData?.label || categoryLabel(selectedCategory)} overlay</p>
+          <p className="toolbar-label">{categoryLabel(selectedCategory)} map layer</p>
           <p className="toolbar-value">
-            {gridLoading ? 'Updating grid...' : gridData ? `${gridData.min}-${gridData.max} ${gridData.units}` : 'No grid'}
+            {selectedCategoryData ? `${selectedCategoryData.score}/100 ensemble score` : 'Waiting for score'}
+          </p>
+          <p className="legend-meta">
+            {gridLoading || !gridIsCurrent
+              ? 'Updating map layer...'
+              : gridIsFlatZero && hasEnsembleScore
+                ? 'No raw CAMS concentration mapped; score includes other provider signals.'
+                : gridData
+                  ? `Map range ${gridData.min}-${gridData.max} ${gridData.units}`
+                  : 'No concentration grid'}
           </p>
         </div>
-        <span className="legend-ramp" aria-hidden="true" />
+        <span className={`legend-ramp ${gridIsFlatZero ? 'flat' : ''}`} aria-hidden="true" />
       </div>
     </section>
   );
@@ -365,15 +385,22 @@ function ForecastSnapshot({ forecast, loading, error, selectedCategory }) {
   return (
     <section className="forecast-snapshot" aria-label="Pollen forecast data">
       <div className="snapshot-primary">
-        <p className="toolbar-label">Synthesized pollen forecast</p>
-        <h2>{loading ? 'Updating forecast...' : aggregate ? scoreLabel(aggregate.score) : 'Waiting for data'}</h2>
+        <p className="toolbar-label">
+          {selected ? `${selected.label} forecast` : 'Synthesized pollen forecast'}
+        </p>
+        <h2>{loading ? 'Updating forecast...' : selected ? scoreLabel(selected.score) : 'Waiting for data'}</h2>
         <p>
           {error
             ? error
-            : aggregate
-              ? `${aggregate.score}/100 ensemble score from ${aggregate.signalCount} contributing signals`
+            : selected
+              ? `${selected.score}/100 ensemble score from ${selected.signalCount} contributing signals`
               : 'Move the map or enable location to request a forecast.'}
         </p>
+        {selected && aggregate && selected.key !== 'aggregate' && (
+          <p className="overall-note">
+            Overall all-pollen forecast: {aggregate.score}/100, {scoreLabel(aggregate.score).toLowerCase()}.
+          </p>
+        )}
       </div>
       <div className="provider-row" aria-label="Provider status">
         {providers.length === 0 && (
@@ -594,6 +621,7 @@ function App() {
         onCenterChange={setForecastPoint}
         onBoundsChange={setMapBounds}
         selectedCategory={selectedCategory}
+        selectedCategoryData={forecast?.ensemble?.[selectedCategory]}
         gridData={gridData}
         gridLoading={gridLoading}
       />

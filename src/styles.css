@@ -317,6 +317,18 @@ h1 {
   background: linear-gradient(90deg, #489b6f, #b2c64e, #edaf49, #da5c46, #74498f);
 }
 
+.legend-ramp.flat {
+  background: #dfe6da;
+}
+
+.legend-meta {
+  margin: 4px 0 0;
+  color: #657168;
+  font-size: 0.78rem;
+  font-weight: 750;
+  line-height: 1.25;
+}
+
 .forecast-snapshot {
   display: grid;
   grid-template-columns: minmax(240px, 0.9fr) minmax(280px, 1.4fr);
@@ -347,6 +359,12 @@ h1 {
   color: #5f6c63;
   font-size: 0.9rem;
   line-height: 1.35;
+}
+
+.snapshot-primary .overall-note {
+  color: #6a746c;
+  font-size: 0.82rem;
+  font-weight: 750;
 }
 
 .provider-row {
@@ -603,9 +621,27 @@ h1 {
 
   .map-legend {
     left: 12px;
-    right: 12px;
-    bottom: 12px;
+    right: 58px;
+    bottom: 24px;
     width: auto;
+  }
+
+  .leaflet-bottom.leaflet-right {
+    bottom: 104px;
+  }
+
+  .leaflet-control-attribution.leaflet-control {
+    position: fixed;
+    top: 294px;
+    right: 28px;
+    margin: 0;
+  }
+
+  .leaflet-control-attribution {
+    max-width: calc(100vw - 32px);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.86);
+    line-height: 1.2;
   }
 
   .category-tile {
