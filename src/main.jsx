@@ -3,13 +3,10 @@ import { createRoot } from 'react-dom/client';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import {
-  Activity,
   ChevronDown,
   Database,
-  LocateFixed,
-  MapPinned,
+  Search,
   Navigation,
-  Wind,
 } from 'lucide-react';
 import { fetchForecast, fetchGrid } from './pollenData.js';
 import './styles.css';
@@ -22,6 +19,40 @@ const INITIAL_BOUNDS = {
   east: 0.15,
   west: -0.35,
 };
+const SEARCH_RESULTS_LIMIT = 3;
+const FALLBACK_LOCATIONS = [
+  { id: 'fallback-london', label: 'London, England', lat: 51.5074, lng: -0.1278, aliases: ['london'] },
+  { id: 'fallback-paris', label: 'Paris, France', lat: 48.8566, lng: 2.3522, aliases: ['paris'] },
+  { id: 'fallback-new-york', label: 'New York, United States', lat: 40.7128, lng: -74.006, aliases: ['new york'] },
+  { id: 'fallback-los-angeles', label: 'Los Angeles, California', lat: 34.0522, lng: -118.2437, aliases: ['los angeles'] },
+  { id: 'fallback-toronto', label: 'Toronto, Ontario', lat: 43.6532, lng: -79.3832, aliases: ['toronto'] },
+  { id: 'fallback-mexico-city', label: 'Mexico City, Mexico', lat: 19.4326, lng: -99.1332, aliases: ['mexico city'] },
+  { id: 'fallback-sao-paulo', label: 'Sao Paulo, Brazil', lat: -23.5558, lng: -46.6396, aliases: ['sao paulo', 'são paulo'] },
+  { id: 'fallback-buenos-aires', label: 'Buenos Aires, Argentina', lat: -34.6037, lng: -58.3816, aliases: ['buenos aires'] },
+  { id: 'fallback-lagos', label: 'Lagos, Lagos State', lat: 6.5244, lng: 3.3792, aliases: ['lagos'] },
+  { id: 'fallback-cairo', label: 'Cairo, Egypt', lat: 30.0444, lng: 31.2357, aliases: ['cairo'] },
+  { id: 'fallback-nairobi', label: 'Nairobi, Kenya', lat: -1.2921, lng: 36.8219, aliases: ['nairobi'] },
+  { id: 'fallback-johannesburg', label: 'Johannesburg, Gauteng', lat: -26.2041, lng: 28.0473, aliases: ['johannesburg'] },
+  { id: 'fallback-mumbai', label: 'Mumbai, Maharashtra', lat: 19.076, lng: 72.8777, aliases: ['mumbai'] },
+  { id: 'fallback-delhi', label: 'Delhi, India', lat: 28.6139, lng: 77.209, aliases: ['delhi', 'new delhi'] },
+  { id: 'fallback-bangkok', label: 'Bangkok, Thailand', lat: 13.7563, lng: 100.5018, aliases: ['bangkok'] },
+  { id: 'fallback-singapore', label: 'Singapore, Singapore', lat: 1.3521, lng: 103.8198, aliases: ['singapore'] },
+  { id: 'fallback-tokyo', label: 'Tokyo, Japan', lat: 35.6762, lng: 139.6503, aliases: ['tokyo'] },
+  { id: 'fallback-seoul', label: 'Seoul, South Korea', lat: 37.5665, lng: 126.978, aliases: ['seoul'] },
+  { id: 'fallback-beijing', label: 'Beijing, China', lat: 39.9042, lng: 116.4074, aliases: ['beijing'] },
+  { id: 'fallback-sydney', label: 'Sydney, New South Wales', lat: -33.8688, lng: 151.2093, aliases: ['sydney'] },
+  { id: 'fallback-auckland', label: 'Auckland, New Zealand', lat: -36.8509, lng: 174.7645, aliases: ['auckland'] },
+  { id: 'fallback-dubai', label: 'Dubai, United Arab Emirates', lat: 25.2048, lng: 55.2708, aliases: ['dubai'] },
+  { id: 'fallback-istanbul', label: 'Istanbul, Turkey', lat: 41.0082, lng: 28.9784, aliases: ['istanbul'] },
+  { id: 'fallback-berlin', label: 'Berlin, Germany', lat: 52.52, lng: 13.405, aliases: ['berlin'] },
+  { id: 'fallback-reykjavik', label: 'Reykjavik, Iceland', lat: 64.1466, lng: -21.9426, aliases: ['reykjavik'] },
+  { id: 'fallback-leeds', label: 'Leeds, England', lat: 53.8008, lng: -1.5491, aliases: ['leeds'] },
+  { id: 'fallback-manchester', label: 'Manchester, England', lat: 53.4808, lng: -2.2426, aliases: ['manchester'] },
+  { id: 'fallback-angel', label: 'Angel, Greater London, England', lat: 51.5319, lng: -0.1058, aliases: ['angel', 'angel london'] },
+  { id: 'fallback-islington', label: 'Islington, Greater London, England', lat: 51.5386, lng: -0.1022, aliases: ['islington', 'islington london'] },
+  { id: 'fallback-shoreditch', label: 'Shoreditch, Greater London, England', lat: 51.5267, lng: -0.0799, aliases: ['shoreditch'] },
+  { id: 'fallback-heathrow', label: 'Heathrow Airport, Greater London, England', lat: 51.47, lng: -0.4543, aliases: ['heathrow', 'heathrow airport'] },
+];
 const CATEGORY_LABELS = {
   aggregate: 'All pollen',
   grass: 'Grass',
@@ -33,11 +64,6 @@ const CATEGORY_LABELS = {
   olive: 'Olive',
   ragweed: 'Ragweed',
 };
-
-function formatCoord(value, axis) {
-  const direction = axis === 'lat' ? (value >= 0 ? 'N' : 'S') : value >= 0 ? 'E' : 'W';
-  return `${Math.abs(value).toFixed(4)}°${direction}`;
-}
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -77,6 +103,124 @@ function categoryLabel(key) {
   return CATEGORY_LABELS[key] || key;
 }
 
+function displayStatus(status) {
+  if (status === 'ok') return 'ok';
+  if (status === 'not-covered') return 'location not covered';
+  return 'no data';
+}
+
+function providerDisplayStatus(provider) {
+  if (provider.status === 'ok') return 'ok';
+  if (provider.status === 'location-not-covered' || provider.status === 'not-covered') {
+    return 'not-covered';
+  }
+  return 'no-data';
+}
+
+function normalizeSearchText(value) {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+function fallbackLocations(query) {
+  const normalizedQuery = normalizeSearchText(query);
+  return FALLBACK_LOCATIONS.filter((location) =>
+    location.aliases.some((alias) => normalizeSearchText(alias).startsWith(normalizedQuery) || normalizedQuery.startsWith(normalizeSearchText(alias))),
+  ).slice(0, SEARCH_RESULTS_LIMIT);
+}
+
+function uniqueLocations(locations) {
+  const seen = new Set();
+  return locations.filter((location) => {
+    const key = normalizeSearchText(location.label);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function firstDistinct(address = {}, keys = [], existing = []) {
+  const normalizedExisting = new Set(existing.filter(Boolean).map(normalizeSearchText));
+  return keys.map((key) => address[key]).find((value) => value && !normalizedExisting.has(normalizeSearchText(value)));
+}
+
+function areaName(address = {}) {
+  return firstDistinct(address, ['neighbourhood', 'suburb', 'city_district', 'quarter', 'borough']);
+}
+
+function localityName(address = {}) {
+  return (
+    address.city ||
+    address.town ||
+    address.village ||
+    address.hamlet ||
+    address.municipality ||
+    address.locality
+  );
+}
+
+function isPlaceSearchResult(result) {
+  const address = result.address || {};
+  if (areaName(address) || localityName(address)) return true;
+  if (
+    result.addresstype &&
+    ['neighbourhood', 'suburb', 'city_district', 'quarter', 'borough', 'city', 'town', 'village', 'hamlet', 'municipality', 'locality'].includes(
+      result.addresstype,
+    )
+  ) {
+    return true;
+  }
+  return Boolean(result.name && !/\bcounty\b/i.test(result.name));
+}
+
+function formatSearchResult(result) {
+  const address = result.address || {};
+  const primary = areaName(address) || localityName(address) || result.name;
+  const context = firstDistinct(address, ['city', 'town', 'village', 'municipality', 'county', 'state_district', 'state', 'region'], [primary]);
+  const region = firstDistinct(address, ['state', 'region', 'country'], [primary, context]);
+  const components = [primary, context, region].filter(Boolean).slice(0, 3);
+
+  return components.length ? components.join(', ') : result.display_name?.split(',').slice(0, 3).join(', ') || 'Unknown location';
+}
+
+async function searchLocations(query, signal) {
+  const trimmed = query.trim();
+  if (trimmed.length < 2) return [];
+
+  const params = new URLSearchParams({
+    q: trimmed,
+    format: 'jsonv2',
+    addressdetails: '1',
+    limit: String(SEARCH_RESULTS_LIMIT),
+  });
+  try {
+    const response = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
+      signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error('Location search unavailable');
+    const data = await response.json();
+    const liveResults = data
+      .filter(isPlaceSearchResult)
+      .map((result) => ({
+        id: result.place_id,
+        label: formatSearchResult(result),
+        lat: Number(result.lat),
+        lng: Number(result.lon),
+      }))
+      .filter((result) => Number.isFinite(result.lat) && Number.isFinite(result.lng));
+    const fallbackResults = fallbackLocations(trimmed).filter(
+      (fallback) => !liveResults.some((result) => normalizeSearchText(result.label) === normalizeSearchText(fallback.label)),
+    );
+    return uniqueLocations([...fallbackResults, ...liveResults]).slice(0, SEARCH_RESULTS_LIMIT);
+  } catch (error) {
+    if (error.name === 'AbortError') throw error;
+    return fallbackLocations(trimmed);
+  }
+}
+
 function useUserLocation() {
   const [location, setLocation] = useState({
     ...LONDON,
@@ -112,7 +256,7 @@ function useUserLocation() {
         source: 'blocked',
         label: 'Location blocked. Showing London, UK.',
         guidance:
-          'Location permission is blocked in this browser. Enable site location permissions, then recheck location.',
+          'Location permission is blocked in this browser. Enable site location permissions, then use the location control.',
       });
       return;
     }
@@ -144,7 +288,7 @@ function useUserLocation() {
             ? 'Location permission denied. Showing London, UK.'
             : 'Location unavailable. Showing London, UK.',
           guidance: blocked
-            ? 'Enable location for this site in browser settings, then recheck location.'
+            ? 'Enable location for this site in browser settings, then use the location control.'
             : 'The browser could not resolve a location before timeout, so London is shown.',
         });
       },
@@ -165,6 +309,11 @@ function useUserLocation() {
 
 function PollenMap({
   location,
+  selectedPlaceLabel,
+  searchLocation,
+  onSearchSelect,
+  onSearchLocationSettled,
+  onRequestLocation,
   onCenterChange,
   onBoundsChange,
   selectedCategory,
@@ -174,13 +323,32 @@ function PollenMap({
 }) {
   const mapNode = useRef(null);
   const mapRef = useRef(null);
-  const markerRef = useRef(null);
   const accuracyRef = useRef(null);
   const overlayRef = useRef(null);
-  const [center, setCenter] = useState(location);
+  const [legendHelpOpen, setLegendHelpOpen] = useState(false);
   const gridIsCurrent = gridData?.category === selectedCategory;
   const gridIsFlatZero = gridIsCurrent && gridData && gridData.min === 0 && gridData.max === 0;
   const hasEnsembleScore = Number(selectedCategoryData?.score) > 0;
+  const legendTooltip = selectedCategoryData
+    ? `${selectedCategoryData.score}/100 is a normalized exposure score from the available forecast sources. The color ramp maps that same score: green 0-24, yellow 25-49, orange 50-74, red 75-100. ${
+        gridLoading || !gridIsCurrent
+          ? 'Updating map layer.'
+          : gridIsFlatZero && hasEnsembleScore
+            ? `No map color is shown because raw ${categoryLabel(selectedCategory).toLowerCase()} pollen amount is unavailable for this area.`
+            : gridData
+              ? `Map color range: ${gridData.min}-${gridData.max} ${gridData.units}.`
+              : 'No concentration grid.'
+      }`
+    : 'The category score and map scale will appear when forecast data loads.';
+
+  const centerOnUser = () => {
+    const map = mapRef.current;
+    if (map && location.source === 'precise') {
+      map.flyTo([location.lat, location.lng], Math.max(map.getZoom(), 14), { duration: 0.55 });
+      return;
+    }
+    onRequestLocation?.();
+  };
 
   useEffect(() => {
     if (!mapNode.current || mapRef.current) return;
@@ -200,11 +368,11 @@ function PollenMap({
     const emitMapState = () => {
       const next = map.getCenter();
       const nextCenter = { lat: next.lat, lng: next.lng };
-      setCenter(nextCenter);
       onCenterChange?.(nextCenter);
       onBoundsChange?.(boundsFromLeaflet(map.getBounds()));
     };
 
+    map.on('move', emitMapState);
     map.on('moveend', emitMapState);
     map.whenReady(emitMapState);
 
@@ -223,23 +391,10 @@ function PollenMap({
     map.setView([location.lat, location.lng], location.source === 'precise' ? 14 : DEFAULT_ZOOM, {
       animate: true,
     });
-    setCenter({ lat: location.lat, lng: location.lng });
     onCenterChange?.({ lat: location.lat, lng: location.lng });
     onBoundsChange?.(boundsFromLeaflet(map.getBounds()));
 
     const latLng = [location.lat, location.lng];
-    if (!markerRef.current) {
-      markerRef.current = L.circleMarker(latLng, {
-        radius: 8,
-        color: '#25352e',
-        weight: 3,
-        fillColor: '#ffffff',
-        fillOpacity: 1,
-      }).addTo(map);
-    } else {
-      markerRef.current.setLatLng(latLng);
-    }
-
     if (accuracyRef.current) {
       accuracyRef.current.remove();
       accuracyRef.current = null;
@@ -255,6 +410,17 @@ function PollenMap({
       }).addTo(map);
     }
   }, [location]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !searchLocation) return;
+
+    const nextCenter = { lat: searchLocation.lat, lng: searchLocation.lng };
+    map.flyTo([searchLocation.lat, searchLocation.lng], 12, { duration: 0.8 });
+    onCenterChange?.(nextCenter);
+    onBoundsChange?.(boundsFromLeaflet(map.getBounds()));
+    onSearchLocationSettled?.();
+  }, [searchLocation]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -324,48 +490,45 @@ function PollenMap({
 
   return (
     <section className="map-section" aria-label="Pollen forecast map">
-      <div className="map-toolbar">
-        <div>
-          <p className="toolbar-label">Map center</p>
-          <p className="toolbar-value">
-            {formatCoord(center.lat, 'lat')} {formatCoord(center.lng, 'lng')}
-          </p>
-        </div>
-        <div className={`location-badge ${location.source}`}>
-          <Navigation size={16} />
-          <span>{location.source === 'pending' ? 'Locating' : location.source}</span>
-        </div>
+      <div className="map-search-panel">
+        <LocationSearch onSelect={onSearchSelect} />
       </div>
-      {location.source !== 'precise' && (
+      <div className="map-toolbar">
+        <button
+          className={`location-badge ${location.source}`}
+          type="button"
+          onClick={centerOnUser}
+          aria-label={location.source === 'precise' ? 'Center map on your location' : 'Request location'}
+          title={location.source === 'precise' ? 'Center map on your location' : location.guidance}
+        >
+          <Navigation size={16} />
+        </button>
+      </div>
+      {location.source !== 'precise' && !selectedPlaceLabel && (
         <div className="permission-panel" role="status" aria-live="polite">
           <p>{location.label}</p>
           <span>{location.guidance}</span>
         </div>
       )}
       <div ref={mapNode} className="leaflet-host" />
-      <div className="map-legend" aria-label="Pollen overlay legend">
+      <div
+        className={`map-legend ${legendHelpOpen ? 'tooltip-open' : ''}`}
+        aria-label={legendTooltip}
+        data-tooltip={legendTooltip}
+        title={legendTooltip}
+        tabIndex={0}
+        onMouseEnter={() => setLegendHelpOpen(true)}
+        onMouseLeave={() => setLegendHelpOpen(false)}
+        onFocus={() => setLegendHelpOpen(true)}
+        onBlur={() => setLegendHelpOpen(false)}
+        onClick={() => setLegendHelpOpen((value) => !value)}
+      >
         <div>
-          <p className="toolbar-label">{categoryLabel(selectedCategory)} allergy score</p>
           <p className="toolbar-value">
-            {selectedCategoryData ? `${selectedCategoryData.score}/100` : 'Waiting for score'}
+            {selectedCategoryData
+              ? `${categoryLabel(selectedCategory)} ${selectedCategoryData.score}/100`
+              : `${categoryLabel(selectedCategory)} score pending`}
           </p>
-          <p className="legend-note">
-            Your allergy score uses all available forecast sources.
-          </p>
-          <p className="legend-meta">
-            {gridLoading || !gridIsCurrent
-              ? 'Updating map layer...'
-              : gridIsFlatZero && hasEnsembleScore
-                ? `No map color is shown because we do not have a raw ${categoryLabel(selectedCategory).toLowerCase()} pollen amount for this area. The score is still available from another forecast source.`
-                : gridData
-                  ? `Map color range: ${gridData.min}-${gridData.max} ${gridData.units}`
-                  : 'No concentration grid'}
-          </p>
-          {gridData && !gridIsFlatZero && gridIsCurrent && (
-            <p className="legend-note">
-              This is the estimated pollen amount in the air. It is separate from the 0-100 allergy score.
-            </p>
-          )}
         </div>
         <span className={`legend-ramp ${gridIsFlatZero ? 'flat' : ''}`} aria-hidden="true" />
       </div>
@@ -383,40 +546,23 @@ function scoreLabel(score) {
 }
 
 function ForecastSnapshot({ forecast, loading, error, selectedCategory }) {
-  const [expanded, setExpanded] = useState(false);
   const [sourcesExpanded, setSourcesExpanded] = useState(false);
   const aggregate = forecast?.ensemble?.aggregate;
   const selected = forecast?.ensemble?.[selectedCategory] || aggregate;
   const providers = forecast?.providers || [];
-  const okProviders = providers.filter((provider) => provider.status === 'ok').length;
-  const providerIssues = providers.filter((provider) => provider.status !== 'ok');
+  const statusCounts = providers.reduce(
+    (counts, provider) => {
+      const status = providerDisplayStatus(provider);
+      counts[status] += 1;
+      return counts;
+    },
+    { ok: 0, 'not-covered': 0, 'no-data': 0 },
+  );
+  const summaryStatus =
+    statusCounts.ok > 0 ? 'ok' : statusCounts['not-covered'] > 0 ? 'not-covered' : 'no-data';
 
   return (
     <section className="forecast-snapshot" aria-label="Pollen forecast data">
-      <div className="snapshot-primary">
-        <p className="toolbar-label">
-          {selected ? `${selected.label} forecast` : 'Synthesized pollen forecast'}
-        </p>
-        <h2>{loading ? 'Updating forecast...' : selected ? scoreLabel(selected.score) : 'Waiting for data'}</h2>
-        <p>
-          {error
-            ? error
-            : selected
-              ? `${selected.score}/100 allergy score from ${selected.signalCount} data source${selected.signalCount === 1 ? '' : 's'}`
-              : 'Move the map or enable location to request a forecast.'}
-        </p>
-        {selected && (
-          <p className="score-note">
-            The score is a normalized 0-100 estimate. Map colors show a raw pollen amount when one is available
-            for this area.
-          </p>
-        )}
-        {selected && aggregate && selected.key !== 'aggregate' && (
-          <p className="overall-note">
-            Overall all-pollen forecast: {aggregate.score}/100, {scoreLabel(aggregate.score).toLowerCase()}.
-          </p>
-        )}
-      </div>
       <button
         className={`sources-toggle ${sourcesExpanded ? 'expanded' : ''}`}
         type="button"
@@ -425,71 +571,52 @@ function ForecastSnapshot({ forecast, loading, error, selectedCategory }) {
       >
         <span>
           <strong>Data sources</strong>
-          <small>
-            {providers.length
-              ? `${okProviders}/${providers.length} currently contributing`
-              : 'Loading source status'}
-          </small>
+          {sourcesExpanded && (
+            <small>
+              {providers.length ? displayStatus(summaryStatus) : loading ? 'no data' : displayStatus(summaryStatus)}
+            </small>
+          )}
         </span>
         <ChevronDown size={18} />
       </button>
       {sourcesExpanded && (
         <>
+          <div className="source-summary">
+            <p>
+              {selected
+                ? `${selected.label}: ${selected.score}/100, ${scoreLabel(selected.score).toLowerCase()}, from ${selected.signalCount} composite input${selected.signalCount === 1 ? '' : 's'}.`
+                : error || 'Move the map or search a location to request a forecast.'}
+            </p>
+            {selected && aggregate && selected.key !== 'aggregate' && (
+              <p>All pollen: {aggregate.score}/100, {scoreLabel(aggregate.score).toLowerCase()}.</p>
+            )}
+          </div>
           <div className="provider-row" aria-label="Provider status">
             {providers.length === 0 && (
               <div className="provider-pill pending">
                 <Database size={16} />
                 <span>Providers pending</span>
+                <strong>{displayStatus('no-data')}</strong>
               </div>
             )}
             {providers.map((provider) => (
-              <div className={`provider-pill ${provider.status}`} key={provider.id} title={provider.notes?.join(' ')}>
+              <div
+                className={`provider-pill ${providerDisplayStatus(provider)}`}
+                key={provider.id}
+                title={provider.notes?.join(' ')}
+              >
                 <Database size={16} />
                 <span>{provider.name}</span>
-                <strong>{provider.status}</strong>
+                <strong>{displayStatus(providerDisplayStatus(provider))}</strong>
               </div>
             ))}
           </div>
-          {forecast && (
-            <p className="snapshot-footnote">
-              Categories are generated from provider data present at this map center.
-            </p>
-          )}
-          {providerIssues.length > 0 && (
-            <div className="provider-issues" aria-label="Provider issues">
-              {providerIssues.map((provider) => (
-                <p key={provider.id}>
-                  <strong>{provider.name}:</strong> {provider.error || provider.notes?.[0] || provider.status}
-                </p>
-              ))}
-            </div>
-          )}
-        </>
-      )}
-      <button
-        className={`ensemble-toggle ${expanded ? 'expanded' : ''}`}
-        type="button"
-        onClick={() => setExpanded((value) => !value)}
-        aria-expanded={expanded}
-      >
-        <span>
-          <strong>Composite ensemble signals</strong>
-          <small>
-            {selected
-              ? `${selected.label}: ${selected.score}/100 from ${selected.signalCount} signals`
-              : 'Waiting for forecast signals'}
-          </small>
-        </span>
-        <ChevronDown size={18} />
-      </button>
-      {expanded && (
-        <div className="ensemble-details" aria-label="Expanded ensemble signal details">
-          {selected?.signals?.length ? (
-            selected.signals.map((signal) => (
+          <div className="ensemble-details" aria-label="Composite data inputs">
+            {selected?.signals?.length ? (
+              selected.signals.map((signal) => (
               <article className="signal-card" key={`${signal.providerId}-${signal.category}`}>
-                <div>
+                <div title={signal.sourceDetail}>
                   <p>{signal.providerName}</p>
-                  <span>{signal.sourceDetail}</span>
                 </div>
                 <dl>
                   <div>
@@ -506,18 +633,104 @@ function ForecastSnapshot({ forecast, loading, error, selectedCategory }) {
                   </div>
                 </dl>
               </article>
-            ))
-          ) : (
-            <p className="empty-detail">No provider signals are available for this category at the current map center.</p>
-          )}
-          {forecast?.caveats?.map((caveat) => (
-            <p className="detail-caveat" key={caveat}>
-              {caveat}
-            </p>
+              ))
+            ) : (
+              <p className="empty-detail">No provider signals are available for this category at the current map center.</p>
+            )}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function LocationSearch({ onSelect }) {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(async () => {
+      const trimmedQuery = query.trim();
+      if (trimmedQuery.length < 2) {
+        setResults([]);
+        setOpen(false);
+        setSearching(false);
+        return;
+      }
+
+      setSearching(true);
+      try {
+        const nextResults = await searchLocations(trimmedQuery, controller.signal);
+        setResults(nextResults);
+        setOpen(nextResults.length > 0);
+      } catch (error) {
+        if (error.name !== 'AbortError') {
+          setResults([]);
+          setOpen(false);
+        }
+      } finally {
+        if (!controller.signal.aborted) setSearching(false);
+      }
+    }, 220);
+
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [query]);
+
+  const chooseResult = (result) => {
+    setQuery(result.label);
+    setOpen(false);
+    onSelect(result);
+  };
+
+  const updateQuery = (value) => {
+    const fallbackResults = value.trim().length >= 2 ? fallbackLocations(value) : [];
+    setQuery(value);
+    setResults(fallbackResults);
+    setOpen(fallbackResults.length > 0);
+    setSearching(value.trim().length >= 2);
+  };
+
+  const submitSearch = (event) => {
+    event.preventDefault();
+    if (results[0]) chooseResult(results[0]);
+  };
+
+  return (
+    <form className="location-search" role="search" onSubmit={submitSearch}>
+      <Search size={16} aria-hidden="true" />
+      <label className="sr-only" htmlFor="location-search">
+        Search location
+      </label>
+      <input
+        id="location-search"
+        type="search"
+        value={query}
+        onChange={(event) => updateQuery(event.target.value)}
+        onFocus={() => setOpen(results.length > 0)}
+        placeholder="Search location"
+        aria-controls="location-search-results"
+        aria-expanded={open}
+        autoComplete="off"
+      />
+      <button type="submit" disabled={!results.length}>
+        {searching ? 'Searching' : 'Search'}
+      </button>
+      {open && (
+        <div className="search-results" id="location-search-results" role="listbox">
+          {results.map((result) => (
+            <button type="button" role="option" key={result.id} onClick={() => chooseResult(result)}>
+              {result.label}
+            </button>
           ))}
         </div>
       )}
-    </section>
+    </form>
   );
 }
 
@@ -561,6 +774,13 @@ function App() {
   const [gridData, setGridData] = useState(null);
   const [gridLoading, setGridLoading] = useState(false);
   const [gridError, setGridError] = useState('');
+  const [searchLocation, setSearchLocation] = useState(null);
+  const [selectedPlaceLabel, setSelectedPlaceLabel] = useState('');
+
+  const selectSearchLocation = (locationResult) => {
+    setSelectedPlaceLabel(locationResult.label);
+    setSearchLocation(locationResult);
+  };
 
   useEffect(() => {
     const controller = new AbortController();
@@ -618,33 +838,6 @@ function App() {
 
   return (
     <main className="app-shell">
-      <section className="hero-panel" aria-labelledby="app-title">
-        <div className="title-block">
-          <div className="brand-mark" aria-hidden="true">
-            <Wind size={20} />
-          </div>
-          <div>
-            <p className="eyebrow">Live allergy planning</p>
-            <h1 id="app-title">Pollen Forecast</h1>
-          </div>
-        </div>
-
-        <div className="status-grid" aria-label="App readiness">
-          <div className="status-tile">
-            <MapPinned size={18} />
-            <span>{location.label}</span>
-          </div>
-          <button className="status-tile action-tile" type="button" onClick={requestLocation}>
-            <LocateFixed size={18} />
-            <span>Recheck location</span>
-          </button>
-          <div className="status-tile compact">
-            <Activity size={18} />
-            <span>{forecast ? `${forecast.categories.length} categories` : 'Loading forecast'}</span>
-          </div>
-        </div>
-      </section>
-
       <CategoryTiles
         categories={forecast?.categories}
         selectedCategory={selectedCategory}
@@ -652,6 +845,11 @@ function App() {
       />
       <PollenMap
         location={location}
+        selectedPlaceLabel={selectedPlaceLabel}
+        searchLocation={searchLocation}
+        onSearchSelect={selectSearchLocation}
+        onSearchLocationSettled={() => setSearchLocation(null)}
+        onRequestLocation={requestLocation}
         onCenterChange={setForecastPoint}
         onBoundsChange={setMapBounds}
         selectedCategory={selectedCategory}
