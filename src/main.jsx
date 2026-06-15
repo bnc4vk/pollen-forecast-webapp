@@ -1,14 +1,18 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import {
   ChevronDown,
+  CloudRain,
   Database,
+  Pause,
+  Play,
   Search,
   Navigation,
+  Wind,
 } from 'lucide-react';
-import { fetchForecast, fetchGrid } from './pollenData.js';
+import { fetchForecast, fetchGrid, fetchWeather } from './pollenData.js';
 import './styles.css';
 
 const LONDON = { lat: 51.5074, lng: -0.1278 };
@@ -20,6 +24,18 @@ const INITIAL_BOUNDS = {
   west: -0.35,
 };
 const SEARCH_RESULTS_LIMIT = 3;
+const LOW_COLOR_THRESHOLD = 10;
+const TIMELAPSE_HORIZONS = [1, 3, 8];
+const DEFAULT_WEATHER = {
+  rain: { key: 'dry', label: 'No rain', multiplier: 1 },
+  wind: { key: 'calm', label: 'Calm', multiplier: 0.92 },
+  multiplier: 0.92,
+  precipitation: 0,
+  windSpeed: 0,
+  windGusts: 0,
+  guidance: 'Live rain and wind will appear when weather data loads.',
+  points: [],
+};
 const FALLBACK_LOCATIONS = [
   { id: 'fallback-london', label: 'London, England', lat: 51.5074, lng: -0.1278, aliases: ['london'] },
   { id: 'fallback-paris', label: 'Paris, France', lat: 48.8566, lng: 2.3522, aliases: ['paris'] },
@@ -74,6 +90,9 @@ function blendChannel(a, b, t) {
 }
 
 function concentrationColor(value, max, alpha = 0.62) {
+  if (!Number.isFinite(value) || value <= LOW_COLOR_THRESHOLD) {
+    return 'rgba(72, 155, 111, 0)';
+  }
   const stops = [
     { t: 0, color: [72, 155, 111] },
     { t: 0.22, color: [178, 198, 78] },
@@ -81,7 +100,8 @@ function concentrationColor(value, max, alpha = 0.62) {
     { t: 0.7, color: [218, 92, 70] },
     { t: 1, color: [116, 73, 143] },
   ];
-  const t = max > 0 ? clamp(value / Math.max(max, 12), 0, 1) : 0;
+  const usableMax = Math.max(max, LOW_COLOR_THRESHOLD + 1);
+  const t = max > LOW_COLOR_THRESHOLD ? clamp((value - LOW_COLOR_THRESHOLD) / (usableMax - LOW_COLOR_THRESHOLD), 0, 1) : 0;
   const upperIndex = stops.findIndex((stop) => stop.t >= t);
   const upper = stops[upperIndex === -1 ? stops.length - 1 : upperIndex];
   const lower = stops[Math.max(0, (upperIndex === -1 ? stops.length - 1 : upperIndex) - 1)];
@@ -101,6 +121,48 @@ function boundsFromLeaflet(bounds) {
 
 function categoryLabel(key) {
   return CATEGORY_LABELS[key] || key;
+}
+
+function weatherProminence(weather, score) {
+  const liveWeather = weather || DEFAULT_WEATHER;
+  const rain = liveWeather.rain || DEFAULT_WEATHER.rain;
+  const wind = liveWeather.wind || DEFAULT_WEATHER.wind;
+  const multiplier = clamp(Number(liveWeather.multiplier ?? rain.multiplier * wind.multiplier) || 1, 0.55, 1.65);
+  const adjustedScore = Number(clamp((Number(score) || 0) * multiplier, 0, 100).toFixed(1));
+  const direction = multiplier < 0.9 ? 'lower' : multiplier > 1.12 ? 'higher' : 'similar';
+
+  return {
+    rain,
+    wind,
+    multiplier,
+    adjustedScore,
+    direction,
+    guidance: liveWeather.guidance || DEFAULT_WEATHER.guidance,
+  };
+}
+
+function frameScore(frame) {
+  if (!frame?.points?.length) return null;
+  const visiblePoints = frame.points.filter((point) => Number.isFinite(point.score));
+  if (!visiblePoints.length) return null;
+  const average = visiblePoints.reduce((sum, point) => sum + point.score, 0) / visiblePoints.length;
+  return Number(average.toFixed(1));
+}
+
+function activeFrameFor(gridData, offset) {
+  if (!gridData?.frames?.length) return null;
+  return (
+    gridData.frames.find((frame) => frame.offsetHours === offset) ||
+    gridData.frames[0]
+  );
+}
+
+function formatFrameTime(time) {
+  if (!time) return '';
+  return new Intl.DateTimeFormat(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(new Date(time));
 }
 
 function displayStatus(status) {
@@ -320,23 +382,44 @@ function PollenMap({
   selectedCategoryData,
   gridData,
   gridLoading,
+  timeOffset,
+  weather,
 }) {
   const mapNode = useRef(null);
   const mapRef = useRef(null);
   const accuracyRef = useRef(null);
   const overlayRef = useRef(null);
+  const weatherOverlayRef = useRef(null);
   const [legendHelpOpen, setLegendHelpOpen] = useState(false);
+  const weatherImpact = useMemo(
+    () => weatherProminence(weather, selectedCategoryData?.score),
+    [weather, selectedCategoryData?.score],
+  );
+  const activeFrame = useMemo(() => activeFrameFor(gridData, timeOffset), [gridData, timeOffset]);
+  const activeGridData = useMemo(() => {
+    if (!gridData) return null;
+    if (!activeFrame) return gridData;
+    return {
+      ...gridData,
+      ...activeFrame,
+      min: activeFrame.min,
+      max: Math.max(gridData.max || 0, activeFrame.max || 0),
+      frameMax: activeFrame.max,
+      frameMin: activeFrame.min,
+    };
+  }, [gridData, activeFrame]);
   const gridIsCurrent = gridData?.category === selectedCategory;
-  const gridIsFlatZero = gridIsCurrent && gridData && gridData.min === 0 && gridData.max === 0;
+  const gridIsFlatZero = gridIsCurrent && activeGridData && activeGridData.min === 0 && activeGridData.frameMax === 0;
   const hasEnsembleScore = Number(selectedCategoryData?.score) > 0;
+  const hasVisibleLayer = gridIsCurrent && activeGridData && (activeGridData.frameMax ?? activeGridData.max) > LOW_COLOR_THRESHOLD;
   const legendTooltip = selectedCategoryData
-    ? `${selectedCategoryData.score}/100 is a normalized exposure score from the available forecast sources. The color ramp maps that same score: green 0-24, yellow 25-49, orange 50-74, red 75-100. ${
+    ? `${selectedCategoryData.score}/100 is a normalized exposure score from the available forecast sources. Weather inputs suggest ${weatherImpact.adjustedScore}/100 prominence, ${weatherImpact.direction} than the raw score. The map leaves 0-${LOW_COLOR_THRESHOLD} ${activeGridData?.units || 'grains/m3'} clear, then colors increasing concentrations. ${
         gridLoading || !gridIsCurrent
           ? 'Updating map layer.'
           : gridIsFlatZero && hasEnsembleScore
             ? `No map color is shown because raw ${categoryLabel(selectedCategory).toLowerCase()} pollen amount is unavailable for this area.`
-            : gridData
-              ? `Map color range: ${gridData.min}-${gridData.max} ${gridData.units}.`
+            : activeGridData
+              ? `Visible frame range: ${activeGridData.frameMin ?? activeGridData.min}-${activeGridData.frameMax ?? activeGridData.max} ${activeGridData.units}.`
               : 'No concentration grid.'
       }`
     : 'The category score and map scale will appear when forecast data loads.';
@@ -431,7 +514,7 @@ function PollenMap({
       overlayRef.current = null;
     }
 
-    if (!gridData?.points?.length || gridData.max <= 0) return;
+    if (!activeGridData?.points?.length || (activeGridData.frameMax ?? activeGridData.max) <= LOW_COLOR_THRESHOLD) return;
 
     const PollenLayer = L.Layer.extend({
       onAdd(activeMap) {
@@ -463,14 +546,16 @@ function PollenMap({
         ctx.clearRect(0, 0, size.x, size.y);
         ctx.globalCompositeOperation = 'source-over';
 
-        const radius = Math.max(size.x / (gridData.cols || 8), size.y / (gridData.rows || 8)) * 1.45;
-        const max = Math.max(gridData.max || 0, 12);
+        const radius = Math.max(size.x / (activeGridData.cols || 8), size.y / (activeGridData.rows || 8)) * 1.45;
+        const max = Math.max(activeGridData.max || 0, LOW_COLOR_THRESHOLD + 1);
+        const weatherAlpha = clamp(weatherImpact.multiplier, 0.72, 1.22);
 
-        for (const point of gridData.points) {
+        for (const point of activeGridData.points) {
+          if (point.value <= LOW_COLOR_THRESHOLD) continue;
           const pixel = map.latLngToContainerPoint([point.lat, point.lng]);
           const gradient = ctx.createRadialGradient(pixel.x, pixel.y, 0, pixel.x, pixel.y, radius);
-          gradient.addColorStop(0, concentrationColor(point.value, max, 0.58));
-          gradient.addColorStop(0.58, concentrationColor(point.value, max, 0.28));
+          gradient.addColorStop(0, concentrationColor(point.value, max, 0.54 * weatherAlpha));
+          gradient.addColorStop(0.58, concentrationColor(point.value, max, 0.25 * weatherAlpha));
           gradient.addColorStop(1, concentrationColor(point.value, max, 0));
           ctx.fillStyle = gradient;
           ctx.beginPath();
@@ -486,7 +571,108 @@ function PollenMap({
       overlayRef.current?.remove();
       overlayRef.current = null;
     };
-  }, [gridData]);
+  }, [activeGridData, weatherImpact.multiplier]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const weatherPoints = weather?.points || [];
+    const activePoints = weatherPoints.filter(
+      (point) => point.precipitation >= 0.1 || point.windSpeed >= 10 || point.windGusts >= 18,
+    );
+    if (!map) return undefined;
+
+    if (weatherOverlayRef.current) {
+      weatherOverlayRef.current.remove();
+      weatherOverlayRef.current = null;
+    }
+
+    if (!activePoints.length) return undefined;
+
+    const WeatherLayer = L.Layer.extend({
+      onAdd(activeMap) {
+        this._map = activeMap;
+        this._canvas = L.DomUtil.create('canvas', 'weather-canvas');
+        this._canvas.setAttribute('aria-hidden', 'true');
+        activeMap.getPanes().overlayPane.appendChild(this._canvas);
+        activeMap.on('move zoom resize viewreset', this._draw, this);
+        this._animate = () => {
+          this._draw();
+          this._raf = window.requestAnimationFrame(this._animate);
+        };
+        this._animate();
+      },
+      onRemove(activeMap) {
+        activeMap.off('move zoom resize viewreset', this._draw, this);
+        if (this._raf) window.cancelAnimationFrame(this._raf);
+        this._canvas?.remove();
+      },
+      _draw() {
+        const size = map.getSize();
+        const topLeft = map.containerPointToLayerPoint([0, 0]);
+        const canvas = this._canvas;
+        const dpr = window.devicePixelRatio || 1;
+        const tick = Date.now() / 1000;
+
+        L.DomUtil.setPosition(canvas, topLeft);
+        canvas.width = size.x * dpr;
+        canvas.height = size.y * dpr;
+        canvas.style.width = `${size.x}px`;
+        canvas.style.height = `${size.y}px`;
+
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, size.x, size.y);
+        ctx.lineCap = 'round';
+
+        for (const point of activePoints) {
+          const pixel = map.latLngToContainerPoint([point.lat, point.lng]);
+          const rainIntensity = clamp(point.precipitation / 5, 0, 1);
+          const windIntensity = clamp(Math.max(point.windSpeed, point.windGusts * 0.72) / 42, 0, 1);
+
+          if (point.precipitation >= 0.1) {
+            const dropCount = 3 + Math.round(rainIntensity * 5);
+            ctx.strokeStyle = `rgba(61, 126, 177, ${0.22 + rainIntensity * 0.32})`;
+            ctx.lineWidth = 1 + rainIntensity;
+            for (let index = 0; index < dropCount; index += 1) {
+              const phase = (tick * (34 + rainIntensity * 28) + index * 17) % 44;
+              const x = pixel.x + ((index % 4) - 1.5) * 9 + Math.sin(tick + index) * 2;
+              const y = pixel.y - 20 + phase;
+              ctx.beginPath();
+              ctx.moveTo(x, y);
+              ctx.lineTo(x - 2, y + 10 + rainIntensity * 7);
+              ctx.stroke();
+            }
+          }
+
+          if (point.windSpeed >= 10 || point.windGusts >= 18) {
+            const angle = ((point.windDirection || 0) - 90) * (Math.PI / 180);
+            const length = 24 + windIntensity * 36;
+            const offset = ((tick * (18 + windIntensity * 18)) % length) - length / 2;
+            const dx = Math.cos(angle);
+            const dy = Math.sin(angle);
+            ctx.strokeStyle = `rgba(236, 250, 242, ${0.28 + windIntensity * 0.36})`;
+            ctx.lineWidth = 1.4 + windIntensity * 1.2;
+            for (let index = 0; index < 3; index += 1) {
+              const side = (index - 1) * 11;
+              const startX = pixel.x - dx * length * 0.45 + dx * offset - dy * side;
+              const startY = pixel.y - dy * length * 0.45 + dy * offset + dx * side;
+              ctx.beginPath();
+              ctx.moveTo(startX, startY);
+              ctx.lineTo(startX + dx * length, startY + dy * length);
+              ctx.stroke();
+            }
+          }
+        }
+      },
+    });
+
+    weatherOverlayRef.current = new WeatherLayer().addTo(map);
+
+    return () => {
+      weatherOverlayRef.current?.remove();
+      weatherOverlayRef.current = null;
+    };
+  }, [weather]);
 
   return (
     <section className="map-section" aria-label="Pollen forecast map">
@@ -511,27 +697,124 @@ function PollenMap({
         </div>
       )}
       <div ref={mapNode} className="leaflet-host" />
-      <div
-        className={`map-legend ${legendHelpOpen ? 'tooltip-open' : ''}`}
-        aria-label={legendTooltip}
-        data-tooltip={legendTooltip}
-        title={legendTooltip}
-        tabIndex={0}
-        onMouseEnter={() => setLegendHelpOpen(true)}
-        onMouseLeave={() => setLegendHelpOpen(false)}
-        onFocus={() => setLegendHelpOpen(true)}
-        onBlur={() => setLegendHelpOpen(false)}
-        onClick={() => setLegendHelpOpen((value) => !value)}
-      >
-        <div>
-          <p className="toolbar-value">
-            {selectedCategoryData
-              ? `${categoryLabel(selectedCategory)} ${selectedCategoryData.score}/100`
-              : `${categoryLabel(selectedCategory)} score pending`}
-          </p>
+      <div className="map-dock">
+        <div
+          className={`map-legend ${legendHelpOpen ? 'tooltip-open' : ''}`}
+          aria-label={legendTooltip}
+          data-tooltip={legendTooltip}
+          title={legendTooltip}
+          tabIndex={0}
+          onMouseEnter={() => setLegendHelpOpen(true)}
+          onMouseLeave={() => setLegendHelpOpen(false)}
+          onFocus={() => setLegendHelpOpen(true)}
+          onBlur={() => setLegendHelpOpen(false)}
+          onClick={() => setLegendHelpOpen((value) => !value)}
+        >
+          <div>
+            <p className="toolbar-value">
+              {selectedCategoryData
+                ? `${categoryLabel(selectedCategory)} ${selectedCategoryData.score}/100`
+                : `${categoryLabel(selectedCategory)} score pending`}
+            </p>
+            {selectedCategoryData && (
+              <span className="legend-adjusted">Weather {weatherImpact.adjustedScore}/100</span>
+            )}
+          </div>
+          <span className={`legend-ramp ${!hasVisibleLayer ? 'flat' : ''}`} aria-hidden="true" />
         </div>
-        <span className={`legend-ramp ${gridIsFlatZero ? 'flat' : ''}`} aria-hidden="true" />
       </div>
+    </section>
+  );
+}
+
+function TimelapseControls({
+  horizon,
+  offset,
+  progress,
+  playing,
+  loading,
+  frame,
+  onHorizonChange,
+  onOffsetChange,
+  onPlayingChange,
+}) {
+  const offsetLabel = offset === 0 ? 'Now' : `+${offset}h`;
+  const progressPercent = horizon > 0 ? clamp((progress / horizon) * 100, 0, 100) : 0;
+  return (
+    <div className="timelapse-panel" aria-label="Timelapse forecast controls">
+      <div className="panel-title">
+        <span>Timelapse</span>
+        <strong>{offsetLabel}{frame?.time ? ` · ${formatFrameTime(frame.time)}` : ''}</strong>
+      </div>
+      <div className="timelapse-actions">
+        <button
+          className="icon-button"
+          type="button"
+          onClick={() => onPlayingChange(!playing)}
+          disabled={loading}
+          aria-label={playing ? 'Pause timelapse' : 'Play timelapse'}
+          title={playing ? 'Pause timelapse' : 'Play timelapse'}
+        >
+          {playing ? <Pause size={16} /> : <Play size={16} />}
+        </button>
+        <div className="segmented-control" aria-label="Timelapse duration">
+          {TIMELAPSE_HORIZONS.map((hours) => (
+            <button
+              className={horizon === hours ? 'active' : ''}
+              type="button"
+              key={hours}
+              onClick={() => onHorizonChange(hours)}
+            >
+              {hours}h
+            </button>
+          ))}
+        </div>
+      </div>
+      <label className="time-scrubber">
+        <span className="sr-only">Forecast hour</span>
+        <span className="scrubber-rail" aria-hidden="true">
+          <span className="scrubber-fill" style={{ width: `${progressPercent}%` }} />
+          <span className="scrubber-thumb" style={{ left: `${progressPercent}%` }} />
+        </span>
+        <input
+          type="range"
+          min="0"
+          max={horizon}
+          step="1"
+          value={Math.min(offset, horizon)}
+          onChange={(event) => onOffsetChange(Number(event.target.value))}
+          disabled={loading}
+        />
+      </label>
+    </div>
+  );
+}
+
+function WeatherPanel({ weather, impact, loading, error }) {
+  const liveWeather = weather || DEFAULT_WEATHER;
+  const rain = liveWeather.rain || DEFAULT_WEATHER.rain;
+  const wind = liveWeather.wind || DEFAULT_WEATHER.wind;
+  const weatherTime = liveWeather.generatedAt ? formatFrameTime(liveWeather.generatedAt) : '';
+
+  return (
+    <section className="weather-panel" aria-label="Live rain and wind guidance">
+      <div className="weather-head">
+        <span>Live weather</span>
+        <strong>{loading ? 'Updating' : weatherTime || 'Pending'}</strong>
+      </div>
+      <div className="weather-metrics">
+        <div>
+          <CloudRain size={15} aria-hidden="true" />
+          <span>{rain.label}</span>
+          <strong>{liveWeather.precipitation ?? 0} mm/h</strong>
+        </div>
+        <div>
+          <Wind size={15} aria-hidden="true" />
+          <span>{wind.label}</span>
+          <strong>{liveWeather.windSpeed ?? 0} km/h</strong>
+        </div>
+      </div>
+      <p>{error || `${impact.guidance} Weather-adjusted prominence: ${impact.adjustedScore}/100.`}</p>
     </section>
   );
 }
@@ -776,6 +1059,38 @@ function App() {
   const [gridError, setGridError] = useState('');
   const [searchLocation, setSearchLocation] = useState(null);
   const [selectedPlaceLabel, setSelectedPlaceLabel] = useState('');
+  const [timelapseHorizon, setTimelapseHorizon] = useState(3);
+  const [timeOffset, setTimeOffset] = useState(0);
+  const [visualTimeOffset, setVisualTimeOffset] = useState(0);
+  const [timelapsePlaying, setTimelapsePlaying] = useState(false);
+  const [weather, setWeather] = useState(DEFAULT_WEATHER);
+  const [weatherLoading, setWeatherLoading] = useState(false);
+  const [weatherError, setWeatherError] = useState('');
+  const visualTimeOffsetRef = useRef(0);
+
+  const activeFrame = useMemo(() => activeFrameFor(gridData, timeOffset), [gridData, timeOffset]);
+  const activeFrameDisplayScore = useMemo(() => frameScore(activeFrame), [activeFrame]);
+  const selectedCategoryData = useMemo(() => {
+    const selected = forecast?.ensemble?.[selectedCategory];
+    if (!selected) return selected;
+    if (activeFrameDisplayScore === null) return selected;
+    return {
+      ...selected,
+      score: activeFrameDisplayScore,
+    };
+  }, [forecast, selectedCategory, activeFrameDisplayScore]);
+  const displayCategories = useMemo(() => {
+    if (!forecast?.categories?.length) return forecast?.categories;
+    return forecast.categories.map((category) => (
+      category.key === selectedCategory && activeFrameDisplayScore !== null
+        ? { ...category, score: activeFrameDisplayScore }
+        : category
+    ));
+  }, [forecast, selectedCategory, activeFrameDisplayScore]);
+  const weatherImpact = useMemo(
+    () => weatherProminence(weather, selectedCategoryData?.score),
+    [weather, selectedCategoryData?.score],
+  );
 
   const selectSearchLocation = (locationResult) => {
     setSelectedPlaceLabel(locationResult.label);
@@ -820,6 +1135,7 @@ function App() {
         const data = await fetchGrid({
           bounds: mapBounds,
           category: selectedCategory,
+          horizonHours: 8,
           signal: controller.signal,
         });
         setGridData(data);
@@ -836,10 +1152,73 @@ function App() {
     };
   }, [mapBounds, selectedCategory]);
 
+  useEffect(() => {
+    if (!mapBounds || !forecastPoint) return;
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(async () => {
+      setWeatherLoading(true);
+      setWeatherError('');
+      try {
+        const data = await fetchWeather({
+          lat: String(forecastPoint.lat),
+          lng: String(forecastPoint.lng),
+          bounds: mapBounds,
+          signal: controller.signal,
+        });
+        setWeather(data);
+      } catch (error) {
+        if (error.name !== 'AbortError') {
+          setWeatherError(error.message);
+        }
+      } finally {
+        if (!controller.signal.aborted) setWeatherLoading(false);
+      }
+    }, 650);
+
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [forecastPoint, mapBounds]);
+
+  useEffect(() => {
+    setTimeOffset(0);
+    setVisualTimeOffset(0);
+  }, [selectedCategory, timelapseHorizon]);
+
+  useEffect(() => {
+    visualTimeOffsetRef.current = visualTimeOffset;
+  }, [visualTimeOffset]);
+
+  useEffect(() => {
+    if (!timelapsePlaying) {
+      setVisualTimeOffset(timeOffset);
+      return undefined;
+    }
+
+    const cycleMs = Math.max(timelapseHorizon, 1) * 900;
+    const startTime = window.performance.now() - (visualTimeOffsetRef.current / Math.max(timelapseHorizon, 1)) * cycleMs;
+    let frameId = 0;
+
+    const tick = (now) => {
+      const elapsed = (now - startTime) % cycleMs;
+      const progress = (elapsed / cycleMs) * timelapseHorizon;
+      const nextOffset = Math.min(timelapseHorizon, Math.floor(progress + 0.001));
+      setVisualTimeOffset(progress);
+      setTimeOffset((current) => (current === nextOffset ? current : nextOffset));
+      frameId = window.requestAnimationFrame(tick);
+    };
+
+    frameId = window.requestAnimationFrame(tick);
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [timelapsePlaying, timelapseHorizon, timeOffset]);
+
   return (
     <main className="app-shell">
       <CategoryTiles
-        categories={forecast?.categories}
+        categories={displayCategories}
         selectedCategory={selectedCategory}
         onSelect={setSelectedCategory}
       />
@@ -853,10 +1232,38 @@ function App() {
         onCenterChange={setForecastPoint}
         onBoundsChange={setMapBounds}
         selectedCategory={selectedCategory}
-        selectedCategoryData={forecast?.ensemble?.[selectedCategory]}
+        selectedCategoryData={selectedCategoryData}
         gridData={gridData}
         gridLoading={gridLoading}
+        timeOffset={timeOffset}
+        weather={weather}
       />
+      <section className="map-control-panel" aria-label="Forecast playback and live weather">
+        <TimelapseControls
+          horizon={timelapseHorizon}
+          offset={timeOffset}
+          progress={visualTimeOffset}
+          playing={timelapsePlaying}
+          loading={gridLoading || gridData?.category !== selectedCategory}
+          frame={activeFrame}
+          onHorizonChange={(hours) => {
+            setTimelapsePlaying(false);
+            setTimelapseHorizon(hours);
+          }}
+          onOffsetChange={(offset) => {
+            setTimelapsePlaying(false);
+            setTimeOffset(offset);
+            setVisualTimeOffset(offset);
+          }}
+          onPlayingChange={setTimelapsePlaying}
+        />
+        <WeatherPanel
+          weather={weather}
+          impact={weatherImpact}
+          loading={weatherLoading}
+          error={weatherError}
+        />
+      </section>
       <ForecastSnapshot
         forecast={forecast}
         loading={forecastLoading}

@@ -44,6 +44,9 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') || ''
 const HAS_API_BASE = Boolean(API_BASE_URL);
 const IS_LOCALHOST = ['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes(window.location.hostname);
 const USE_LOCAL_API = IS_LOCALHOST && !HAS_API_BASE;
+const MAX_TIMELAPSE_HOURS = 8;
+const WEATHER_GRID_ROWS = 4;
+const WEATHER_GRID_COLS = 4;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -143,6 +146,129 @@ function openMeteoCategoryValue(current, category) {
   if (category === 'tree') return values.alder + values.birch + values.olive;
   if (category === 'weed') return values.mugwort + values.ragweed;
   return values[category] ?? values.grass;
+}
+
+function openMeteoHourlyValues(hourly, index) {
+  return Object.fromEntries(
+    OPEN_METEO_POLLEN.map((key) => [key, Number(hourly?.[key]?.[index] ?? 0)]),
+  );
+}
+
+function nearestHourlyIndex(hourly) {
+  const times = hourly?.time || [];
+  const now = Date.now();
+  let nearestIndex = 0;
+  let nearestDistance = Infinity;
+
+  times.forEach((time, index) => {
+    const distance = Math.abs(new Date(time).getTime() - now);
+    if (distance < nearestDistance) {
+      nearestIndex = index;
+      nearestDistance = distance;
+    }
+  });
+
+  return nearestIndex;
+}
+
+function buildGridPoints(bounds, rows, cols) {
+  const latStep = (bounds.north - bounds.south) / Math.max(rows - 1, 1);
+  const lngStep = (bounds.east - bounds.west) / Math.max(cols - 1, 1);
+  const points = [];
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      points.push({
+        lat: bounds.south + latStep * row,
+        lng: bounds.west + lngStep * col,
+      });
+    }
+  }
+
+  return points;
+}
+
+function classifyRain({ precipitation = 0, weatherCode = 0, windGusts = 0 }) {
+  const stormCode = [95, 96, 99].includes(Number(weatherCode));
+  if (stormCode || (precipitation >= 2.5 && windGusts >= 28) || precipitation >= 6) {
+    return {
+      key: 'storm',
+      label: 'Storm rain',
+      multiplier: 1.12,
+      guidance: 'Storm rain is treated cautiously because fragmentation and downdrafts can worsen exposure.',
+    };
+  }
+  if (precipitation >= 0.1) {
+    return {
+      key: 'steady',
+      label: 'Rain nearby',
+      multiplier: 0.74,
+      guidance: 'Rain is treated as a temporary washout input where it is falling steadily.',
+    };
+  }
+  return {
+    key: 'dry',
+    label: 'No rain',
+    multiplier: 1,
+    guidance: 'No meaningful rain is currently reducing airborne pollen.',
+  };
+}
+
+function classifyWind({ windSpeed = 0, windGusts = 0 }) {
+  if (windSpeed >= 24 || windGusts >= 35) {
+    return {
+      key: 'gusty',
+      label: 'Gusty',
+      multiplier: 1.28,
+      guidance: 'Gusty wind can lift and redistribute pollen quickly.',
+    };
+  }
+  if (windSpeed >= 10 || windGusts >= 18) {
+    return {
+      key: 'breezy',
+      label: 'Breezy',
+      multiplier: 1.08,
+      guidance: 'Breezy conditions can move pollen farther from source areas.',
+    };
+  }
+  return {
+    key: 'calm',
+    label: 'Calm',
+    multiplier: 0.92,
+    guidance: 'Calm air limits pollen spread.',
+  };
+}
+
+function weatherProminenceFromLive(rain, wind) {
+  const stormGustBoost = rain.key === 'storm' && wind.key === 'gusty' ? 1.12 : 1;
+  return clamp(rain.multiplier * wind.multiplier * stormGustBoost, 0.55, 1.65);
+}
+
+function summarizeWeather(points) {
+  const precipitation = Math.max(...points.map((point) => point.precipitation), 0);
+  const windSpeed = points.reduce((sum, point) => sum + point.windSpeed, 0) / Math.max(points.length, 1);
+  const windGusts = Math.max(...points.map((point) => point.windGusts), 0);
+  const weatherCode = points.find((point) => [95, 96, 99].includes(point.weatherCode))?.weatherCode || points[0]?.weatherCode || 0;
+  const rain = classifyRain({ precipitation, weatherCode, windGusts });
+  const wind = classifyWind({ windSpeed, windGusts });
+  const multiplier = weatherProminenceFromLive(rain, wind);
+
+  return {
+    rain,
+    wind,
+    multiplier,
+    precipitation: Number(precipitation.toFixed(2)),
+    windSpeed: Number(windSpeed.toFixed(1)),
+    windGusts: Number(windGusts.toFixed(1)),
+    guidance:
+      rain.key === 'storm'
+        ? rain.guidance
+        : wind.key === 'gusty'
+          ? wind.guidance
+          : rain.key === 'steady'
+            ? rain.guidance
+            : 'Live rain and wind are applied as high-level exposure context.',
+  };
 }
 
 async function fetchOpenMeteo(lat, lng) {
@@ -420,56 +546,117 @@ async function buildBrowserForecast(lat, lng) {
   };
 }
 
-async function fetchOpenMeteoGrid(bounds, category) {
+async function fetchOpenMeteoGrid(bounds, category, horizonHours = MAX_TIMELAPSE_HOURS) {
   const rows = 8;
   const cols = 8;
-  const latStep = (bounds.north - bounds.south) / Math.max(rows - 1, 1);
-  const lngStep = (bounds.east - bounds.west) / Math.max(cols - 1, 1);
-  const points = [];
-
-  for (let row = 0; row < rows; row += 1) {
-    for (let col = 0; col < cols; col += 1) {
-      points.push({
-        lat: bounds.south + latStep * row,
-        lng: bounds.west + lngStep * col,
-      });
-    }
-  }
+  const safeHorizon = clamp(Number(horizonHours) || MAX_TIMELAPSE_HOURS, 1, MAX_TIMELAPSE_HOURS);
+  const points = buildGridPoints(bounds, rows, cols);
 
   const params = new URLSearchParams({
     latitude: points.map((point) => point.lat.toFixed(5)).join(','),
     longitude: points.map((point) => point.lng.toFixed(5)).join(','),
-    current: OPEN_METEO_POLLEN.join(','),
-    forecast_days: '1',
+    hourly: OPEN_METEO_POLLEN.join(','),
+    forecast_days: '2',
     timezone: 'auto',
   });
   const data = await fetchJson(`https://air-quality-api.open-meteo.com/v1/air-quality?${params}`);
   const payloads = Array.isArray(data) ? data : [data];
+  const startIndices = payloads.map((payload) => nearestHourlyIndex(payload.hourly || {}));
 
-  const gridPoints = payloads.map((payload, index) => {
-    const sourcePoint = points[index] || { lat: payload.latitude, lng: payload.longitude };
-    const value = openMeteoCategoryValue(payload.current || {}, category);
+  const frames = Array.from({ length: safeHorizon + 1 }, (_, offsetHours) => {
+    const gridPoints = payloads.map((payload, index) => {
+      const sourcePoint = points[index] || { lat: payload.latitude, lng: payload.longitude };
+      const hourly = payload.hourly || {};
+      const values = openMeteoHourlyValues(hourly, Math.min((startIndices[index] || 0) + offsetHours, (hourly.time?.length || 1) - 1));
+      const value = openMeteoCategoryValue(values, category);
+      return {
+        lat: Number(sourcePoint.lat.toFixed(5)),
+        lng: Number(sourcePoint.lng.toFixed(5)),
+        value: Number(value.toFixed(2)),
+        score: Number(indexToScore(rawConcentrationToIndex(value)).toFixed(1)),
+      };
+    });
+    const values = gridPoints.map((point) => point.value);
+    const firstHourly = payloads[0]?.hourly || {};
+    const firstTimeIndex = Math.min((startIndices[0] || 0) + offsetHours, (firstHourly.time?.length || 1) - 1);
+
     return {
-      lat: Number(sourcePoint.lat.toFixed(5)),
-      lng: Number(sourcePoint.lng.toFixed(5)),
-      value: Number(value.toFixed(2)),
-      score: Number(indexToScore(rawConcentrationToIndex(value)).toFixed(1)),
+      offsetHours,
+      time: firstHourly.time?.[firstTimeIndex] || null,
+      min: Number(Math.min(...values).toFixed(2)),
+      max: Number(Math.max(...values).toFixed(2)),
+      points: gridPoints,
     };
   });
 
-  const values = gridPoints.map((point) => point.value);
+  const firstFrame = frames[0] || { min: 0, max: 0, points: [] };
+  const frameMins = frames.map((frame) => frame.min);
+  const frameMaxes = frames.map((frame) => frame.max);
   return {
     category,
     label: categoryName(category),
     units: 'grains/m3',
-    source: 'Open-Meteo / CAMS coordinate-list grid',
+    source: 'Open-Meteo / CAMS hourly coordinate-list grid',
     generatedAt: new Date().toISOString(),
     bounds,
     rows,
     cols,
-    min: Number(Math.min(...values).toFixed(2)),
-    max: Number(Math.max(...values).toFixed(2)),
-    points: gridPoints,
+    horizonHours: safeHorizon,
+    offsetHours: firstFrame.offsetHours,
+    time: firstFrame.time,
+    min: Number(Math.min(...frameMins).toFixed(2)),
+    max: Number(Math.max(...frameMaxes).toFixed(2)),
+    points: firstFrame.points,
+    frames,
+  };
+}
+
+async function buildBrowserWeather(lat, lng, bounds) {
+  const rows = WEATHER_GRID_ROWS;
+  const cols = WEATHER_GRID_COLS;
+  const points = bounds ? buildGridPoints(bounds, rows, cols) : [{ lat, lng }];
+  const params = new URLSearchParams({
+    latitude: points.map((point) => Number(point.lat).toFixed(5)).join(','),
+    longitude: points.map((point) => Number(point.lng).toFixed(5)).join(','),
+    current: 'precipitation,rain,showers,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m',
+    forecast_hours: '3',
+    timezone: 'auto',
+  });
+  const data = await fetchJson(`https://api.open-meteo.com/v1/forecast?${params}`);
+  const payloads = Array.isArray(data) ? data : [data];
+  const weatherPoints = payloads.map((payload, index) => {
+    const sourcePoint = points[index] || { lat: payload.latitude, lng: payload.longitude };
+    const current = payload.current || {};
+    const precipitation = Number(current.precipitation || 0);
+    const windSpeed = Number(current.wind_speed_10m || 0);
+    const windGusts = Number(current.wind_gusts_10m || windSpeed);
+    const weatherCode = Number(current.weather_code || 0);
+
+    return {
+      lat: Number(sourcePoint.lat.toFixed(5)),
+      lng: Number(sourcePoint.lng.toFixed(5)),
+      precipitation: Number(precipitation.toFixed(2)),
+      rain: Number(current.rain || 0),
+      showers: Number(current.showers || 0),
+      weatherCode,
+      windSpeed: Number(windSpeed.toFixed(1)),
+      windGusts: Number(windGusts.toFixed(1)),
+      windDirection: Number(current.wind_direction_10m || 0),
+      rainKey: classifyRain({ precipitation, weatherCode, windGusts }).key,
+      windKey: classifyWind({ windSpeed, windGusts }).key,
+    };
+  });
+  const summary = summarizeWeather(weatherPoints);
+
+  return {
+    source: 'Open-Meteo Weather Forecast',
+    generatedAt: new Date().toISOString(),
+    location: { lat, lng },
+    bounds,
+    rows,
+    cols,
+    points: weatherPoints,
+    ...summary,
   };
 }
 
@@ -490,14 +677,28 @@ export function fetchForecast({ lat, lng, signal }) {
   return buildBrowserForecast(lat, lng);
 }
 
-export function fetchGrid({ bounds, category, signal }) {
+export function fetchGrid({ bounds, category, horizonHours = MAX_TIMELAPSE_HOURS, signal }) {
   if (HAS_API_BASE || USE_LOCAL_API) {
     return fetchApiJson('/api/grid', {
       ...Object.fromEntries(
         Object.entries(bounds).map(([key, value]) => [key, String(Number(value).toFixed(5))]),
       ),
       category,
+      horizonHours,
     }, signal);
   }
-  return fetchOpenMeteoGrid(bounds, category);
+  return fetchOpenMeteoGrid(bounds, category, horizonHours);
+}
+
+export function fetchWeather({ lat, lng, bounds, signal }) {
+  if (HAS_API_BASE || USE_LOCAL_API) {
+    return fetchApiJson('/api/weather', {
+      lat,
+      lng,
+      ...Object.fromEntries(
+        Object.entries(bounds || {}).map(([key, value]) => [key, String(Number(value).toFixed(5))]),
+      ),
+    }, signal);
+  }
+  return buildBrowserWeather(Number(lat), Number(lng), bounds);
 }
