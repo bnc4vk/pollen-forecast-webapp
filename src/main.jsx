@@ -6,18 +6,19 @@ import {
   ChevronDown,
   CloudRain,
   Database,
-  Info,
   Pause,
   Play,
   Search,
   Navigation,
   Wind,
 } from 'lucide-react';
-import { fetchForecast, fetchGrid, fetchWeather } from './pollenData.js';
+import { fetchForecast, fetchGrid, fetchRegions, fetchSpatial, fetchWeather } from './pollenData.js';
 import './styles.css';
 
 const LONDON = { lat: 51.5074, lng: -0.1278 };
 const DEFAULT_ZOOM = 12;
+const REGIONAL_ZOOM = 5;
+const SPATIAL_11KM_ZOOM = 9.5;
 const INITIAL_BOUNDS = {
   north: 51.7,
   south: 51.3,
@@ -71,7 +72,7 @@ const FALLBACK_LOCATIONS = [
   { id: 'fallback-heathrow', label: 'Heathrow Airport, Greater London, England', lat: 51.47, lng: -0.4543, aliases: ['heathrow', 'heathrow airport'] },
 ];
 const CATEGORY_LABELS = {
-  aggregate: 'All pollen',
+  aggregate: 'Worst',
   grass: 'Grass',
   tree: 'Tree',
   weed: 'Weed',
@@ -117,6 +118,59 @@ function boundsFromLeaflet(bounds) {
     east: bounds.getEast(),
     west: bounds.getWest(),
   };
+}
+
+function pointInRing([lng, lat], ring) {
+  let inside = false;
+  for (let index = 0, previous = ring.length - 1; index < ring.length; previous = index, index += 1) {
+    const [x, y] = ring[index];
+    const [previousX, previousY] = ring[previous];
+    const intersects =
+      y > lat !== previousY > lat &&
+      lng < ((previousX - x) * (lat - y)) / (previousY - y || Number.EPSILON) + x;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function featureContainsPoint(feature, point) {
+  const polygons =
+    feature?.geometry?.type === 'Polygon'
+      ? [feature.geometry.coordinates]
+      : feature?.geometry?.type === 'MultiPolygon'
+        ? feature.geometry.coordinates
+        : [];
+  return polygons.some(
+    (polygon) =>
+      pointInRing(point, polygon[0]) &&
+      !polygon.slice(1).some((hole) => pointInRing(point, hole)),
+  );
+}
+
+function nearestRegionalForecast(regions, point) {
+  if (!regions?.length || !point) return null;
+  const lngScale = Math.cos((point.lat * Math.PI) / 180);
+  return regions.reduce((nearest, region) => {
+    const distance = (point.lat - region.lat) ** 2 + ((point.lng - region.lng) * lngScale) ** 2;
+    return !nearest || distance < nearest.distance ? { ...region, distance } : nearest;
+  }, null);
+}
+
+function regionalCategoryList(region) {
+  if (!region?.scores) return [];
+  return ['grass', 'tree', 'weed', 'alder', 'birch', 'olive', 'mugwort', 'ragweed']
+    .map((key) => region.scores[key] && { key, ...region.scores[key] })
+    .filter(Boolean);
+}
+
+function cellContainsPoint(cell, point) {
+  if (!cell?.bounds || !point) return false;
+  return (
+    point.lat >= cell.bounds.south &&
+    point.lat <= cell.bounds.north &&
+    point.lng >= cell.bounds.west &&
+    point.lng <= cell.bounds.east
+  );
 }
 
 function categoryLabel(key) {
@@ -410,17 +464,28 @@ function PollenMap({
   onRequestLocation,
   onCenterChange,
   onBoundsChange,
+  onZoomChange,
   selectedCategory,
   selectedCategoryData,
   gridData,
   gridLoading,
   timeProgress,
   weather,
+  regionalData,
+  regionalLoading,
+  regionalError,
+  activeRegion,
+  spatialData,
+  spatialLoading,
+  spatialError,
+  activeCell,
 }) {
   const mapNode = useRef(null);
   const mapRef = useRef(null);
   const accuracyRef = useRef(null);
   const overlayRef = useRef(null);
+  const regionalOverlayRef = useRef(null);
+  const regionalFitRef = useRef(false);
   const weatherOverlayRef = useRef(null);
   const [legendHelpOpen, setLegendHelpOpen] = useState(false);
   const activeFrame = useMemo(
@@ -443,20 +508,22 @@ function PollenMap({
   const gridIsCurrent = gridData?.category === selectedCategory;
   const gridIsFlatZero = gridIsCurrent && activeGridData && activeGridData.min === 0 && activeGridData.frameMax === 0;
   const hasEnsembleScore = Number(selectedCategoryData?.score) > 0;
-  const hasVisibleLayer =
-    gridIsCurrent &&
-    activeGridData?.points?.some((point) => Number(point.score) > LOW_COLOR_THRESHOLD);
-  const legendTooltip = selectedCategoryData
-    ? `The top tile is the current-location composite (${selectedCategoryData.score}/100). This map number is the area-average CAMS forecast for the selected time. Map colors use the same fixed 0-100 scale: green is low, amber moderate, red high, and purple very high. ${
-        gridLoading || !gridIsCurrent
-          ? 'Updating map layer.'
-          : gridIsFlatZero && hasEnsembleScore
-            ? `No map color is shown because raw ${categoryLabel(selectedCategory).toLowerCase()} pollen amount is unavailable for this area.`
-            : activeGridData
-              ? `Current map average: ${mapScore ?? 0}/100.`
-              : 'No concentration grid.'
-      }`
-    : 'The category score and map scale will appear when forecast data loads.';
+  const hasVisibleLayer = Boolean(spatialData?.cells?.length || regionalData?.regions?.length);
+  const regionalCategory = selectedCategory || 'aggregate';
+  const activeArea = activeCell || activeRegion;
+  const activeAreaScore = activeArea?.scores?.[regionalCategory];
+  const activeAreaLabel = activeCell
+    ? `${activeCell.regionName} · ${activeCell.scaleLabel}`
+    : activeRegion?.name;
+  const legendTooltip = spatialError || regionalError
+    ? spatialError || regionalError
+    : spatialLoading
+      ? 'Loading scale-adjusted pollen cells for this map view.'
+      : regionalLoading
+        ? 'Building a daily ensemble for the 16 Met Office pollen regions.'
+        : activeArea
+          ? `${activeAreaLabel}: ${activeAreaScore?.label || 'Pollen risk'} ${activeAreaScore?.score ?? 0}/100. Provider weights reflect the displayed spatial scale.`
+          : 'Pan over the UK to inspect the daily pollen ensemble.';
 
   const centerOnUser = () => {
     const map = mapRef.current;
@@ -472,15 +539,17 @@ function PollenMap({
 
     const map = L.map(mapNode.current, {
       zoomControl: false,
+      zoomSnap: 0.25,
       preferCanvas: true,
       attributionControl: true,
-    }).setView([location.lat, location.lng], DEFAULT_ZOOM);
+    }).setView([location.lat, location.lng], REGIONAL_ZOOM);
 
     map.attributionControl.setPrefix(false);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
       attribution: '&copy; OpenStreetMap contributors',
     }).addTo(map);
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
 
     const PollenLayer = L.Layer.extend({
       onAdd(activeMap) {
@@ -553,9 +622,9 @@ function PollenMap({
       const nextCenter = { lat: next.lat, lng: next.lng };
       onCenterChange?.(nextCenter);
       onBoundsChange?.(boundsFromLeaflet(map.getBounds()));
+      onZoomChange?.(map.getZoom());
     };
 
-    map.on('move', emitMapState);
     map.on('moveend', emitMapState);
     map.whenReady(emitMapState);
 
@@ -572,11 +641,19 @@ function PollenMap({
     const map = mapRef.current;
     if (!map) return;
 
-    map.setView([location.lat, location.lng], location.source === 'precise' ? 14 : DEFAULT_ZOOM, {
-      animate: true,
-    });
-    onCenterChange?.({ lat: location.lat, lng: location.lng });
+    if (location.source === 'pending') return;
+
+    if (location.source === 'precise') {
+      regionalFitRef.current = true;
+      map.setView([location.lat, location.lng], 14, { animate: false });
+    } else if (!regionalFitRef.current) {
+      map.setView([54.65, -3.2], REGIONAL_ZOOM, { animate: false });
+      regionalFitRef.current = true;
+    }
+    const nextCenter = map.getCenter();
+    onCenterChange?.({ lat: nextCenter.lat, lng: nextCenter.lng });
     onBoundsChange?.(boundsFromLeaflet(map.getBounds()));
+    onZoomChange?.(map.getZoom());
 
     const latLng = [location.lat, location.lng];
     if (accuracyRef.current) {
@@ -600,7 +677,7 @@ function PollenMap({
     if (!map || !searchLocation) return;
 
     const nextCenter = { lat: searchLocation.lat, lng: searchLocation.lng };
-    map.flyTo([searchLocation.lat, searchLocation.lng], 12, { duration: 0.8 });
+    map.flyTo([searchLocation.lat, searchLocation.lng], 7, { duration: 0.8 });
     onCenterChange?.(nextCenter);
     onBoundsChange?.(boundsFromLeaflet(map.getBounds()));
     onSearchLocationSettled?.();
@@ -609,6 +686,80 @@ function PollenMap({
   useEffect(() => {
     overlayRef.current?.setData(gridIsCurrent ? activeGridData : null);
   }, [activeGridData, gridIsCurrent]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    regionalOverlayRef.current?.remove();
+    regionalOverlayRef.current = null;
+    const usingSpatialCells = Boolean(spatialData?.cells?.length);
+    if (!usingSpatialCells && !regionalData?.geojson?.features?.length) return;
+
+    const areasById = new Map(
+      (usingSpatialCells ? spatialData.cells : regionalData.regions).map((area) => [area.id, area]),
+    );
+    const geojson = usingSpatialCells
+      ? {
+          type: 'FeatureCollection',
+          features: spatialData.cells.map((cell) => ({
+            type: 'Feature',
+            properties: { id: cell.id },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[
+                [cell.bounds.west, cell.bounds.south],
+                [cell.bounds.east, cell.bounds.south],
+                [cell.bounds.east, cell.bounds.north],
+                [cell.bounds.west, cell.bounds.north],
+                [cell.bounds.west, cell.bounds.south],
+              ]],
+            },
+          })),
+        }
+      : regionalData.geojson;
+    const layer = L.geoJSON(geojson, {
+      renderer: L.canvas({ padding: 0.5 }),
+      smoothFactor: usingSpatialCells ? 0 : 2,
+      style: (feature) => {
+        const area = areasById.get(feature.properties?.id);
+        const score = Number(area?.scores?.[regionalCategory]?.score || 0);
+        return {
+          color: usingSpatialCells ? 'rgba(255, 255, 255, 0.62)' : 'rgba(255, 255, 255, 0.9)',
+          weight: usingSpatialCells ? 0.8 : 1.4,
+          opacity: 0.9,
+          fillColor: scoreColor(score, 1),
+          fillOpacity: usingSpatialCells ? 0.64 : 0.58,
+        };
+      },
+      onEachFeature: (feature, featureLayer) => {
+        const area = areasById.get(feature.properties?.id);
+        if (!area) return;
+        const categoryScore = area.scores?.[regionalCategory];
+        const score = categoryScore?.score ?? 0;
+        const label = usingSpatialCells
+          ? `${area.regionName} · ${area.scaleLabel}`
+          : area.name;
+        featureLayer.bindTooltip(`${label} · ${categoryScore?.label || 'Pollen'} ${score}/100`, {
+          className: 'regional-tooltip',
+          sticky: true,
+        });
+        featureLayer.on({
+          mouseover: () => featureLayer.setStyle({ weight: 2.2, fillOpacity: 0.72 }),
+          mouseout: () =>
+            featureLayer.setStyle({
+              weight: usingSpatialCells ? 0.8 : 1.4,
+              fillOpacity: usingSpatialCells ? 0.64 : 0.58,
+            }),
+        });
+      },
+    }).addTo(map);
+
+    regionalOverlayRef.current = layer;
+    if (!regionalFitRef.current && location.source !== 'pending') {
+      map.setView([54.65, -3.2], REGIONAL_ZOOM, { animate: false });
+      regionalFitRef.current = true;
+    }
+  }, [regionalData, regionalCategory, spatialData, location.source]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -729,8 +880,14 @@ function PollenMap({
       </div>
       {location.source !== 'precise' && !selectedPlaceLabel && (
         <div className="permission-panel" role="status" aria-live="polite">
-          <p>{location.label}</p>
-          <span>{location.guidance}</span>
+          <p>{spatialData ? `Showing ${spatialData.scaleLabel.toLowerCase()} detail.` : regionalData ? 'Showing the UK regional overview.' : location.label}</p>
+          <span>
+            {spatialData
+              ? 'Move or zoom the map to update the active pollen cell.'
+              : regionalData
+              ? 'Search or move the map to inspect a region. Location access is not required for this view.'
+              : location.guidance}
+          </span>
         </div>
       )}
       <div ref={mapNode} className="leaflet-host" />
@@ -749,9 +906,15 @@ function PollenMap({
         >
           <div>
             <p className="toolbar-value">
-              {selectedCategoryData
-                ? `${categoryLabel(selectedCategory)} map ${mapScore ?? '—'}/100`
-                : `${categoryLabel(selectedCategory)} score pending`}
+              {spatialError || regionalError
+                ? 'Spatial forecast unavailable'
+                : spatialLoading
+                  ? 'Loading local pollen cells'
+                  : regionalLoading
+                    ? 'Loading 16 UK regions'
+                    : activeArea
+                      ? `${activeAreaLabel} · ${activeAreaScore?.label || 'Pollen'} ${activeAreaScore?.score ?? 0}/100`
+                      : 'UK regional pollen risk'}
             </p>
           </div>
           <span className={`legend-ramp ${!hasVisibleLayer ? 'flat' : ''}`} aria-hidden="true" />
@@ -770,6 +933,7 @@ function TimelapseControls({
   onHorizonChange,
   onOffsetChange,
   onPlayingChange,
+  regionalMode = false,
 }) {
   const roundedMinutes = Math.round((progress * 60) / 15) * 15;
   const offsetLabel =
@@ -782,12 +946,16 @@ function TimelapseControls({
         : `+${Math.floor(roundedMinutes / 60)}h ${roundedMinutes % 60}m`;
   const progressPercent = horizon > 0 ? clamp((progress / horizon) * 100, 0, 100) : 0;
   return (
-    <div className="timelapse-panel" aria-label="Timelapse forecast controls">
+    <div
+      className={`timelapse-panel ${regionalMode ? 'disabled' : ''}`}
+      aria-label={regionalMode ? 'Daily regional forecast' : 'Timelapse forecast controls'}
+    >
       <div className="panel-title">
-        <span>Timelapse</span>
+        <span>{regionalMode ? 'Regional forecast' : 'Timelapse'}</span>
         <strong>
-          {offsetLabel}
-          {frame?.time ? ` · ${formatFrameTime(frame.time, 15)}` : ''}
+          {regionalMode
+            ? 'Daily'
+            : `${offsetLabel}${frame?.time ? ` · ${formatFrameTime(frame.time, 15)}` : ''}`}
         </strong>
       </div>
       <div className="timelapse-actions">
@@ -795,7 +963,7 @@ function TimelapseControls({
           className="icon-button"
           type="button"
           onClick={() => onPlayingChange(!playing)}
-          disabled={loading}
+          disabled={loading || regionalMode}
           aria-label={playing ? 'Pause timelapse' : 'Play timelapse'}
           title={playing ? 'Pause timelapse' : 'Play timelapse'}
         >
@@ -808,6 +976,7 @@ function TimelapseControls({
               type="button"
               key={hours}
               onClick={() => onHorizonChange(hours)}
+              disabled={loading || regionalMode}
             >
               {hours}h
             </button>
@@ -827,7 +996,7 @@ function TimelapseControls({
           step="0.05"
           value={Math.min(progress, horizon)}
           onChange={(event) => onOffsetChange(Number(event.target.value))}
-          disabled={loading}
+          disabled={loading || regionalMode}
         />
       </label>
     </div>
@@ -872,11 +1041,28 @@ function scoreLabel(score) {
   return 'Very high';
 }
 
-function ForecastSnapshot({ forecast, loading, error, selectedCategory }) {
+function ForecastSnapshot({
+  forecast,
+  loading,
+  error,
+  selectedCategory,
+  regionalMode = false,
+  activeRegion,
+}) {
   const [sourcesExpanded, setSourcesExpanded] = useState(false);
   const aggregate = forecast?.ensemble?.aggregate;
-  const selected = forecast?.ensemble?.[selectedCategory] || aggregate;
-  const providers = forecast?.providers || [];
+  const regionalCategory = selectedCategory || 'aggregate';
+  const selected = regionalMode
+    ? activeRegion?.scores?.[regionalCategory]
+    : selectedCategory
+      ? forecast?.ensemble?.[selectedCategory]
+      : null;
+  const providers = regionalMode
+    ? activeRegion?.providerStatus || []
+    : forecast?.providers || [];
+  const areaLabel = activeRegion?.scaleLabel
+    ? `${activeRegion.regionName} · ${activeRegion.scaleLabel}`
+    : activeRegion?.name;
   const statusCounts = providers.reduce(
     (counts, provider) => {
       const status = providerDisplayStatus(provider);
@@ -910,12 +1096,14 @@ function ForecastSnapshot({ forecast, loading, error, selectedCategory }) {
         <>
           <div className="source-summary">
             <p>
-              {selected
+              {regionalMode && activeRegion
+                ? `${areaLabel}: ${selected?.label || 'Daily ensemble'} ${selected?.score ?? 0}/100, from ${selected?.signalCount || 0} provider input${selected?.signalCount === 1 ? '' : 's'}.`
+                : selected
                 ? `${selected.label}: ${selected.score}/100, ${scoreLabel(selected.score).toLowerCase()}, from ${selected.signalCount} composite input${selected.signalCount === 1 ? '' : 's'}.`
-                : error || 'Move the map or search a location to request a forecast.'}
+                : error || 'Select an allergen to inspect its composite forecast.'}
             </p>
-            {selected && aggregate && selected.key !== 'aggregate' && (
-              <p>All pollen: {aggregate.score}/100, {scoreLabel(aggregate.score).toLowerCase()}.</p>
+            {!regionalMode && selected && aggregate && selected.key !== 'aggregate' && (
+              <p>Worst: {aggregate.score}/100, {scoreLabel(aggregate.score).toLowerCase()}.</p>
             )}
           </div>
           <div className="provider-row" aria-label="Provider status">
@@ -934,7 +1122,11 @@ function ForecastSnapshot({ forecast, loading, error, selectedCategory }) {
               >
                 <Database size={16} />
                 <span>{provider.name}</span>
-                <strong>{displayStatus(providerDisplayStatus(provider))}</strong>
+                <strong>
+                  {providerDisplayStatus(provider) === 'ok' && Number.isFinite(provider.weightMultiplier)
+                    ? `${Math.round(provider.weightMultiplier * 100)}% weight`
+                    : displayStatus(providerDisplayStatus(provider))}
+                </strong>
               </div>
             ))}
           </div>
@@ -958,11 +1150,22 @@ function ForecastSnapshot({ forecast, loading, error, selectedCategory }) {
                     <dt>Raw</dt>
                     <dd>{signal.value === null ? signal.units : `${signal.value} ${signal.units}`}</dd>
                   </div>
+                  <div>
+                    <dt>Scale weight</dt>
+                    <dd>{Math.round((signal.weightMultiplier ?? 1) * 100)}%</dd>
+                  </div>
                 </dl>
+                {signal.spatialRole && <small>{signal.spatialRole}</small>}
               </article>
               ))
             ) : (
-              <p className="empty-detail">No provider signals are available for this category at the current map center.</p>
+              <p className="empty-detail">
+                {selectedCategory
+                  ? 'No provider signals are available for this category in the active region.'
+                  : regionalMode
+                    ? 'No provider signals are available for this regional category.'
+                    : 'Select an allergen to view its provider signals.'}
+              </p>
             )}
           </div>
         </>
@@ -1061,68 +1264,52 @@ function LocationSearch({ onSelect }) {
   );
 }
 
-function CategoryTiles({ categories, selectedCategory, onSelect }) {
-  const [aggregateHelpOpen, setAggregateHelpOpen] = useState(false);
-  const aggregateExplanation =
-    'All pollen uses the highest grass, tree, or weed severity from each source, then confidence-weights those source scores. This avoids diluting one high allergen or inflating the result by adding unlike concentrations.';
+function CategoryTiles({ categories, selectedCategory, onSelect, disabled = false }) {
   if (!categories?.length) {
     return (
       <section className="category-tiles" aria-label="Pollen category filters">
-        <button className="category-tile active" type="button">
-          <span>All pollen</span>
+        <button className="category-tile" type="button" disabled>
+          <span>Pollen data</span>
           <strong>Loading</strong>
         </button>
       </section>
     );
   }
 
+  const categoriesByKey = Object.fromEntries(categories.map((category) => [category.key, category]));
+  const renderTile = (categoryKey) => {
+    const category = categoriesByKey[categoryKey];
+    if (!category) return null;
+
+    return (
+      <button
+        className={`category-tile ${selectedCategory === category.key ? 'active' : ''}`}
+        type="button"
+        key={category.key}
+        onClick={() => onSelect(category.key)}
+        disabled={disabled}
+        title={disabled ? 'Allergen filters are paused while the regional ensemble is evaluated.' : undefined}
+      >
+        <span className="category-label">{category.label}</span>
+        <strong>{category.score}/100</strong>
+      </button>
+    );
+  };
+
   return (
-    <>
-      <section className="category-tiles" aria-label="Pollen category filters">
-        {categories.map((category) => (
-          <button
-            className={`category-tile ${selectedCategory === category.key ? 'active' : ''}`}
-            type="button"
-            key={category.key}
-            onClick={(event) => {
-              if (category.key === 'aggregate' && event.target.closest('.score-info')) {
-                event.stopPropagation();
-                setAggregateHelpOpen((open) => !open);
-                return;
-              }
-              setAggregateHelpOpen(false);
-              onSelect(category.key);
-            }}
-            aria-describedby={category.key === 'aggregate' ? 'aggregate-score-explanation' : undefined}
-          >
-            <span className="category-label">
-              {category.label}
-              {category.key === 'aggregate' && (
-                <span
-                  className="score-info"
-                  aria-hidden="true"
-                  title="How the All pollen score is calculated"
-                  onMouseEnter={() => setAggregateHelpOpen(true)}
-                  onMouseLeave={() => setAggregateHelpOpen(false)}
-                >
-                  <Info size={13} aria-hidden="true" />
-                </span>
-              )}
-            </span>
-            <strong>{category.score}/100</strong>
-          </button>
-        ))}
-        <span className="sr-only" id="aggregate-score-explanation">
-          {aggregateExplanation}
-        </span>
-      </section>
-      {aggregateHelpOpen && (
-        <div className="aggregate-score-tooltip" role="tooltip">
-          <strong>How All pollen is calculated</strong>
-          <span>{aggregateExplanation}</span>
+    <section className="category-tiles" aria-label="Pollen category filters">
+      <div className="category-group">
+        <div className="category-group-tiles">
+          {['grass', 'tree', 'weed'].map(renderTile)}
         </div>
-      )}
-    </>
+      </div>
+
+      <div className="category-group">
+        <div className="category-group-tiles">
+          {['alder', 'birch', 'olive', 'mugwort', 'ragweed'].map(renderTile)}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -1130,13 +1317,20 @@ function App() {
   const { location, requestLocation } = useUserLocation();
   const [forecastPoint, setForecastPoint] = useState(LONDON);
   const [mapBounds, setMapBounds] = useState(INITIAL_BOUNDS);
-  const [selectedCategory, setSelectedCategory] = useState('aggregate');
+  const [mapZoom, setMapZoom] = useState(REGIONAL_ZOOM);
+  const [selectedCategory, setSelectedCategory] = useState(null);
   const [forecast, setForecast] = useState(null);
   const [forecastError, setForecastError] = useState('');
   const [forecastLoading, setForecastLoading] = useState(false);
   const [gridData, setGridData] = useState(null);
   const [gridLoading, setGridLoading] = useState(false);
   const [gridError, setGridError] = useState('');
+  const [regionalData, setRegionalData] = useState(null);
+  const [regionalLoading, setRegionalLoading] = useState(true);
+  const [regionalError, setRegionalError] = useState('');
+  const [spatialData, setSpatialData] = useState(null);
+  const [spatialLoading, setSpatialLoading] = useState(false);
+  const [spatialError, setSpatialError] = useState('');
   const [searchLocation, setSearchLocation] = useState(null);
   const [selectedPlaceLabel, setSelectedPlaceLabel] = useState('');
   const [timelapseHorizon, setTimelapseHorizon] = useState(3);
@@ -1152,15 +1346,59 @@ function App() {
     [gridData, visualTimeOffset],
   );
   const selectedCategoryData = forecast?.ensemble?.[selectedCategory];
+  const activeRegion = useMemo(() => {
+    if (!regionalData?.regions?.length || !forecastPoint) return null;
+    const feature = regionalData.geojson?.features?.find((candidate) =>
+      featureContainsPoint(candidate, [forecastPoint.lng, forecastPoint.lat]),
+    );
+    return (
+      regionalData.regions.find((region) => region.id === feature?.properties?.id) ||
+      nearestRegionalForecast(regionalData.regions, forecastPoint)
+    );
+  }, [regionalData, forecastPoint]);
+  const activeCell = useMemo(() => {
+    if (!spatialData?.cells?.length || !forecastPoint) return null;
+    return (
+      spatialData.cells.find((cell) => cellContainsPoint(cell, forecastPoint)) ||
+      spatialData.cells.reduce((nearest, cell) => {
+        const distance = (cell.lat - forecastPoint.lat) ** 2 + (cell.lng - forecastPoint.lng) ** 2;
+        return !nearest || distance < nearest.distance ? { ...cell, distance } : nearest;
+      }, null)
+    );
+  }, [spatialData, forecastPoint]);
+  const activeArea = activeCell || activeRegion;
+  const regionalCategories = useMemo(() => regionalCategoryList(activeArea), [activeArea]);
+  const activeRegionalScore = activeArea?.scores?.[selectedCategory || 'aggregate'];
   const weatherImpact = useMemo(
-    () => weatherProminence(weather, selectedCategoryData?.score),
-    [weather, selectedCategoryData?.score],
+    () => weatherProminence(weather, activeRegionalScore?.score),
+    [weather, activeRegionalScore?.score],
   );
 
   const selectSearchLocation = (locationResult) => {
     setSelectedPlaceLabel(locationResult.label);
     setSearchLocation(locationResult);
   };
+
+  useEffect(() => {
+    if (regionalData) {
+      setForecast(null);
+      setForecastLoading(false);
+      setForecastError('');
+      return undefined;
+    }
+    const controller = new AbortController();
+    setRegionalLoading(true);
+    setRegionalError('');
+    fetchRegions({ signal: controller.signal })
+      .then(setRegionalData)
+      .catch((error) => {
+        if (error.name !== 'AbortError') setRegionalError(error.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setRegionalLoading(false);
+      });
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1187,10 +1425,50 @@ function App() {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [forecastPoint]);
+  }, [forecastPoint, regionalData]);
 
   useEffect(() => {
-    if (!mapBounds) return;
+    if (!mapBounds || mapZoom < SPATIAL_11KM_ZOOM) {
+      setSpatialData(null);
+      setSpatialLoading(false);
+      setSpatialError('');
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(async () => {
+      setSpatialLoading(true);
+      setSpatialError('');
+      try {
+        const data = await fetchSpatial({
+          bounds: mapBounds,
+          zoom: mapZoom,
+          signal: controller.signal,
+        });
+        setSpatialData(data);
+      } catch (error) {
+        if (error.name !== 'AbortError') {
+          setSpatialError(error.message);
+          setSpatialData(null);
+        }
+      } finally {
+        if (!controller.signal.aborted) setSpatialLoading(false);
+      }
+    }, 550);
+
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [mapBounds, mapZoom]);
+
+  useEffect(() => {
+    if (regionalData || !mapBounds || !selectedCategory) {
+      setGridData(null);
+      setGridLoading(false);
+      setGridError('');
+      return undefined;
+    }
 
     const controller = new AbortController();
     const timeout = window.setTimeout(async () => {
@@ -1215,7 +1493,7 @@ function App() {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [mapBounds, selectedCategory]);
+  }, [regionalData, mapBounds, selectedCategory]);
 
   useEffect(() => {
     if (!mapBounds || !forecastPoint) return;
@@ -1292,11 +1570,11 @@ function App() {
   return (
     <main className="app-shell">
       <CategoryTiles
-        categories={forecast?.categories}
+        categories={regionalCategories.length ? regionalCategories : forecast?.categories}
         selectedCategory={selectedCategory}
         onSelect={(category) => {
           setTimelapsePlaying(false);
-          setSelectedCategory(category);
+          setSelectedCategory((selected) => (selected === category ? null : category));
         }}
       />
       <PollenMap
@@ -1308,12 +1586,21 @@ function App() {
         onRequestLocation={requestLocation}
         onCenterChange={setForecastPoint}
         onBoundsChange={setMapBounds}
+        onZoomChange={setMapZoom}
         selectedCategory={selectedCategory}
         selectedCategoryData={selectedCategoryData}
         gridData={gridData}
         gridLoading={gridLoading}
         timeProgress={visualTimeOffset}
         weather={weather}
+        regionalData={regionalData}
+        regionalLoading={regionalLoading}
+        regionalError={regionalError}
+        activeRegion={activeRegion}
+        spatialData={spatialData}
+        spatialLoading={spatialLoading}
+        spatialError={spatialError}
+        activeCell={activeCell}
       />
       <section className="map-control-panel" aria-label="Forecast playback and live weather">
         <TimelapseControls
@@ -1331,6 +1618,7 @@ function App() {
             setVisualTimeOffset(offset);
           }}
           onPlayingChange={setTimelapsePlaying}
+          regionalMode
         />
         <WeatherPanel
           weather={weather}
@@ -1344,6 +1632,8 @@ function App() {
         loading={forecastLoading}
         error={forecastError || gridError}
         selectedCategory={selectedCategory}
+        regionalMode
+        activeRegion={activeArea}
       />
     </main>
   );

@@ -29,7 +29,7 @@ const OPEN_METEO_POLLEN = [
 ];
 
 const CATEGORY_DEFS = {
-  aggregate: { label: 'All pollen', type: 'aggregate' },
+  aggregate: { label: 'Worst', type: 'aggregate' },
   grass: { label: 'Grass', type: 'family' },
   tree: { label: 'Tree', type: 'family' },
   weed: { label: 'Weed', type: 'family' },
@@ -113,11 +113,35 @@ const MET_OFFICE_REGIONS = [
 const MAX_TIMELAPSE_HOURS = 8;
 const WEATHER_GRID_ROWS = 4;
 const WEATHER_GRID_COLS = 4;
+const SPATIAL_11KM_ZOOM = 9.5;
+const SPATIAL_1KM_ZOOM = 13;
+const MAX_SPATIAL_CELLS = 144;
+const SPATIAL_SCALE_CONFIG = {
+  regional: {
+    cellKm: null,
+    label: 'Met Office region',
+    weights: { metoffice: 1, polleninformation: 1, openmeteo: 1, google: 1 },
+  },
+  '11km': {
+    cellKm: 11,
+    label: '11 km cell',
+    weights: { metoffice: 0.45, polleninformation: 0.55, openmeteo: 1, google: 1.05 },
+  },
+  '1km': {
+    cellKm: 1,
+    label: '1 km cell',
+    weights: { metoffice: 0.18, polleninformation: 0.25, openmeteo: 0.45, google: 1.2 },
+  },
+};
 
 const cache = new Map();
 const pollenInformationCache = new Map();
 const pollenInformationPending = new Map();
+const regionalForecastContexts = new Map();
+const regionalForecastContextPending = new Map();
+const spatialCellForecastCache = new Map();
 let metOfficePageCache = null;
+let metOfficePolygonsCache = null;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -215,6 +239,59 @@ async function fetchMetOfficePage() {
   const html = await fetchText(MET_OFFICE_POLLEN_URL);
   metOfficePageCache = { created: Date.now(), html };
   return html;
+}
+
+function parseMetOfficeGeoJson(script) {
+  const marker = 'globalThis.metoffice.pollenForecast.polygonsGeoJson=';
+  const start = script.indexOf(marker);
+  const end = script.indexOf(';', start + marker.length);
+  if (start < 0 || end < 0) throw new Error('Met Office region polygons were not found');
+
+  const json = script
+    .slice(start + marker.length, end)
+    .replace(/([{,])\s*([A-Za-z]+):/g, '$1"$2":')
+    .replace(/([\[,])(-?)\.(\d)/g, '$1$20.$3')
+    .replace(/\\x26/g, '&');
+  const geojson = JSON.parse(json);
+  geojson.features = geojson.features.filter((feature) =>
+    ['Polygon', 'MultiPolygon'].includes(feature.geometry?.type),
+  );
+  const simplifyRing = (ring, tolerance = 0.04) => {
+    if (ring.length < 5) return ring;
+    const simplified = [ring[0]];
+    let previous = ring[0];
+    for (let index = 1; index < ring.length - 1; index += 1) {
+      const point = ring[index];
+      const lngScale = Math.cos((point[1] * Math.PI) / 180);
+      const distance = Math.hypot((point[0] - previous[0]) * lngScale, point[1] - previous[1]);
+      if (distance >= tolerance) {
+        simplified.push(point);
+        previous = point;
+      }
+    }
+    simplified.push(ring[ring.length - 1]);
+    return simplified.length >= 4 ? simplified : ring;
+  };
+  for (const feature of geojson.features) {
+    if (feature.geometry.type === 'Polygon') {
+      feature.geometry.coordinates = feature.geometry.coordinates.map((ring) => simplifyRing(ring));
+    } else {
+      feature.geometry.coordinates = feature.geometry.coordinates.map((polygon) =>
+        polygon.map((ring) => simplifyRing(ring)),
+      );
+    }
+  }
+  return geojson;
+}
+
+async function fetchMetOfficePolygons() {
+  if (metOfficePolygonsCache) return metOfficePolygonsCache;
+  const html = await fetchMetOfficePage();
+  const scriptPath = html.match(/src="([^"]+\/js\/pollen-forecast\/pollen-forecast\.js)"/)?.[1];
+  if (!scriptPath) throw new Error('Met Office pollen map script was not found');
+  const script = await fetchText(new URL(scriptPath, MET_OFFICE_POLLEN_URL).toString());
+  metOfficePolygonsCache = parseMetOfficeGeoJson(script);
+  return metOfficePolygonsCache;
 }
 
 function decodeHtml(value) {
@@ -910,11 +987,11 @@ function statusProvider(id, name, error) {
 
 function synthesize(providers) {
   const ensemble = {};
-  const present = new Set(['aggregate']);
+  const present = new Set();
 
   for (const provider of providers) {
     for (const category of Object.keys(provider.categories || {})) {
-      present.add(category);
+      if (category !== 'aggregate') present.add(category);
     }
   }
 
@@ -928,6 +1005,10 @@ function synthesize(providers) {
           providerName: provider.name,
           modelFamily: provider.modelFamily,
           ...signal,
+          baseConfidence: signal.confidence,
+          confidence: Number((signal.confidence * (provider.weightMultiplier ?? 1)).toFixed(3)),
+          weightMultiplier: provider.weightMultiplier ?? 1,
+          spatialRole: provider.spatialRole || 'direct',
         };
       })
       .filter(Boolean);
@@ -951,7 +1032,277 @@ function synthesize(providers) {
     };
   }
 
+  const familyScores = ['grass', 'tree', 'weed']
+    .map((category) => ensemble[category])
+    .filter(Boolean);
+  if (familyScores.length > 0) {
+    const worst = familyScores.reduce(
+      (highest, category) => (category.score > highest.score ? category : highest),
+      familyScores[0],
+    );
+    ensemble.aggregate = {
+      ...worst,
+      key: 'aggregate',
+      label: categoryName('aggregate'),
+      type: 'aggregate',
+      dominantCategory: worst.key,
+    };
+  }
+
   return ensemble;
+}
+
+function spatialTierForZoom(zoom) {
+  if (zoom >= SPATIAL_1KM_ZOOM) return '1km';
+  if (zoom >= SPATIAL_11KM_ZOOM) return '11km';
+  return 'regional';
+}
+
+function cloneProviderWithWeight(provider, tier, spatialRole) {
+  const weightMultiplier = SPATIAL_SCALE_CONFIG[tier].weights[provider.id] ?? 0;
+  return {
+    ...provider,
+    weightMultiplier,
+    spatialRole,
+    notes: [
+      ...(provider.notes || []),
+      `${SPATIAL_SCALE_CONFIG[tier].label}: ${Math.round(weightMultiplier * 100)}% scale weight; ${spatialRole}.`,
+    ],
+  };
+}
+
+function pointInRing([lng, lat], ring) {
+  let inside = false;
+  for (let index = 0, previous = ring.length - 1; index < ring.length; previous = index, index += 1) {
+    const [x, y] = ring[index];
+    const [previousX, previousY] = ring[previous];
+    const intersects =
+      y > lat !== previousY > lat &&
+      lng < ((previousX - x) * (lat - y)) / (previousY - y || Number.EPSILON) + x;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function featureContainsPoint(feature, point) {
+  const polygons =
+    feature?.geometry?.type === 'Polygon'
+      ? [feature.geometry.coordinates]
+      : feature?.geometry?.type === 'MultiPolygon'
+        ? feature.geometry.coordinates
+        : [];
+  return polygons.some(
+    (polygon) =>
+      pointInRing(point, polygon[0]) &&
+      !polygon.slice(1).some((hole) => pointInRing(point, hole)),
+  );
+}
+
+function regionForPoint(geojson, lat, lng) {
+  const feature = geojson.features.find((candidate) => featureContainsPoint(candidate, [lng, lat]));
+  return MET_OFFICE_REGIONS.find((region) => region.id === feature?.properties?.id) || null;
+}
+
+function buildSpatialCells(bounds, cellKm, geojson) {
+  const latStep = cellKm / 111.32;
+  const southIndex = Math.floor((bounds.south + 90) / latStep);
+  const northIndex = Math.floor((bounds.north + 90) / latStep);
+  const cells = [];
+
+  for (let latIndex = southIndex; latIndex <= northIndex; latIndex += 1) {
+    const south = latIndex * latStep - 90;
+    const north = south + latStep;
+    const lat = (south + north) / 2;
+    const lngStep = cellKm / (111.32 * Math.max(Math.cos((lat * Math.PI) / 180), 0.2));
+    const westIndex = Math.floor((bounds.west + 180) / lngStep);
+    const eastIndex = Math.floor((bounds.east + 180) / lngStep);
+    for (let lngIndex = westIndex; lngIndex <= eastIndex; lngIndex += 1) {
+      const west = lngIndex * lngStep - 180;
+      const east = west + lngStep;
+      const lng = (west + east) / 2;
+      const region = regionForPoint(geojson, lat, lng);
+      if (!region) continue;
+      cells.push({
+        id: `${cellKm}:${latIndex}:${lngIndex}`,
+        lat: Number(lat.toFixed(5)),
+        lng: Number(lng.toFixed(5)),
+        bounds: {
+          north: Number(north.toFixed(5)),
+          south: Number(south.toFixed(5)),
+          east: Number(east.toFixed(5)),
+          west: Number(west.toFixed(5)),
+        },
+        regionId: region.id,
+        regionName: region.name,
+      });
+    }
+  }
+
+  if (cells.length > MAX_SPATIAL_CELLS) {
+    throw new Error(`This view contains ${cells.length} cells; zoom in to load ${cellKm} km data.`);
+  }
+  return cells;
+}
+
+function spatialCellForPoint(lat, lng, cellKm) {
+  const latStep = cellKm / 111.32;
+  const latIndex = Math.floor((lat + 90) / latStep);
+  const south = latIndex * latStep - 90;
+  const north = south + latStep;
+  const centerLat = (south + north) / 2;
+  const lngStep = cellKm / (111.32 * Math.max(Math.cos((centerLat * Math.PI) / 180), 0.2));
+  const lngIndex = Math.floor((lng + 180) / lngStep);
+  const west = lngIndex * lngStep - 180;
+  const east = west + lngStep;
+  return {
+    id: `${cellKm}:${latIndex}:${lngIndex}`,
+    lat: Number(centerLat.toFixed(5)),
+    lng: Number(((west + east) / 2).toFixed(5)),
+    bounds: { north, south, east, west },
+  };
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+async function regionalForecastContext(region) {
+  if (regionalForecastContexts.has(region.id)) return regionalForecastContexts.get(region.id);
+  if (!regionalForecastContextPending.has(region.id)) {
+    regionalForecastContextPending.set(
+      region.id,
+      buildForecast(region.lat, region.lng)
+        .then((forecast) => {
+          regionalForecastContexts.set(region.id, forecast);
+          return forecast;
+        })
+        .finally(() => regionalForecastContextPending.delete(region.id)),
+    );
+  }
+  return regionalForecastContextPending.get(region.id);
+}
+
+async function buildSpatialCellForecast(cell, tier) {
+  const cacheKey = `${tier}:${cell.id}`;
+  const cached = spatialCellForecastCache.get(cacheKey);
+  if (cached && Date.now() - cached.created < 4 * 60 * 60 * 1000) return cached.value;
+  const region = MET_OFFICE_REGIONS.find((candidate) => candidate.id === cell.regionId);
+  const regional = await regionalForecastContext(region);
+  const coarseProviders = regional.providers.filter((provider) =>
+    ['metoffice', 'polleninformation'].includes(provider.id),
+  );
+
+  let directProviders;
+  if (tier === '11km') {
+    const settled = await Promise.allSettled([
+      fetchOpenMeteo(cell.lat, cell.lng),
+      fetchGooglePollen(cell.lat, cell.lng),
+    ]);
+    directProviders = settled.map((result, index) =>
+      result.status === 'fulfilled'
+        ? result.value
+        : statusProvider(
+            index === 0 ? 'openmeteo' : 'google',
+            index === 0 ? 'Open-Meteo / CAMS' : 'Google Pollen API',
+            result.reason,
+          ),
+    );
+  } else {
+    const parent = spatialCellForPoint(cell.lat, cell.lng, 11);
+    const settled = await Promise.allSettled([
+      fetchOpenMeteo(parent.lat, parent.lng),
+      fetchGooglePollen(cell.lat, cell.lng),
+    ]);
+    directProviders = settled.map((result, index) =>
+      result.status === 'fulfilled'
+        ? result.value
+        : statusProvider(
+            index === 0 ? 'openmeteo' : 'google',
+            index === 0 ? 'Open-Meteo / CAMS' : 'Google Pollen API',
+            result.reason,
+          ),
+    );
+  }
+
+  const providers = [
+    ...coarseProviders.map((provider) =>
+      cloneProviderWithWeight(provider, tier, `inherited from ${cell.regionName}`),
+    ),
+    ...directProviders.map((provider) =>
+      cloneProviderWithWeight(
+        provider,
+        tier,
+        tier === '1km' && provider.id === 'openmeteo'
+          ? 'inherited from containing 11 km CAMS cell'
+          : `requested at ${SPATIAL_SCALE_CONFIG[tier].label} center`,
+      ),
+    ),
+  ];
+  const ensemble = synthesize(providers);
+  const scores = Object.fromEntries(
+    Object.entries(ensemble).map(([category, value]) => [
+      category,
+      {
+        label: value.label,
+        score: value.score,
+        index: value.index,
+        signalCount: value.signalCount,
+        signals: value.signals,
+      },
+    ]),
+  );
+
+  const value = {
+    ...cell,
+    scale: tier,
+    scaleLabel: SPATIAL_SCALE_CONFIG[tier].label,
+    scores,
+    providerStatus: providers.map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      status: provider.status,
+      weightMultiplier: provider.weightMultiplier,
+      spatialRole: provider.spatialRole,
+      notes: provider.notes,
+    })),
+  };
+  spatialCellForecastCache.set(cacheKey, { created: Date.now(), value });
+  return value;
+}
+
+async function buildSpatialForecast(bounds, zoom) {
+  const tier = spatialTierForZoom(zoom);
+  if (tier === 'regional') {
+    throw new Error('Regional zoom uses the Met Office region ensemble.');
+  }
+  const geojson = await fetchMetOfficePolygons();
+  const cells = buildSpatialCells(bounds, SPATIAL_SCALE_CONFIG[tier].cellKm, geojson);
+  const forecasts = await mapWithConcurrency(cells, 8, (cell) => buildSpatialCellForecast(cell, tier));
+  return {
+    mode: 'adaptive-spatial-ensemble',
+    tier,
+    scaleKm: SPATIAL_SCALE_CONFIG[tier].cellKm,
+    scaleLabel: SPATIAL_SCALE_CONFIG[tier].label,
+    generatedAt: new Date().toISOString(),
+    cells: forecasts,
+    weighting: SPATIAL_SCALE_CONFIG[tier].weights,
+    notes: [
+      'Met Office and Austrian signals are inherited from the containing regional context.',
+      tier === '11km'
+        ? 'Open-Meteo and Google are requested at each 11 km cell center.'
+        : 'Google is requested at each 1 km cell center; Open-Meteo is inherited from the containing 11 km cell.',
+    ],
+  };
 }
 
 async function buildForecast(lat, lng) {
@@ -989,8 +1340,55 @@ async function buildForecast(lat, lng) {
       'Open-Meteo uses the CAMS model family, so CAMS is not counted as a separate ensemble member.',
       'Austrian Pollen Information Service data is used in its documented supported countries, cached for four hours by country and area, and licensed for non-commercial use.',
       'Met Office pollen is an independent UK-only regional model and is weighted below the location-specific sources.',
-      'All pollen uses each source’s highest grass, tree, or weed severity, then confidence-weights the source scores.',
+      'Worst is the highest confidence-weighted ensemble score among grass, tree, and weed.',
       'Provider indices are normalized onto a 0-100 score for blending; raw Open-Meteo concentrations are retained in signal details.',
+    ],
+  };
+}
+
+async function buildRegionalForecast() {
+  await fetchMetOfficePage();
+  const geojson = await fetchMetOfficePolygons();
+  const forecasts = await Promise.all(
+    MET_OFFICE_REGIONS.map(async (region) => {
+      const forecast = await buildForecast(region.lat, region.lng);
+      regionalForecastContexts.set(region.id, forecast);
+      const scores = Object.fromEntries(
+        Object.entries(forecast.ensemble).map(([category, value]) => [
+          category,
+          {
+            label: value.label,
+            score: value.score,
+            index: value.index,
+            signalCount: value.signalCount,
+            signals: value.signals,
+          },
+        ]),
+      );
+      return {
+        ...region,
+        scores,
+        providerStatus: forecast.providers.map((provider) => ({
+          id: provider.id,
+          name: provider.name,
+          status: provider.status,
+          weightMultiplier: 1,
+          spatialRole: 'requested at Met Office region center',
+          notes: provider.notes,
+        })),
+      };
+    }),
+  );
+
+  return {
+    mode: 'met-office-regional-ensemble',
+    generatedAt: new Date().toISOString(),
+    category: 'aggregate',
+    regions: forecasts,
+    geojson,
+    notes: [
+      'Region boundaries are the GeoJSON polygons published by the Met Office pollen map.',
+      'Each region score blends Met Office regional pollen with Open-Meteo, Google Pollen, and Austrian Pollen Information data requested at that region’s representative center.',
     ],
   };
 }
@@ -1001,6 +1399,23 @@ app.get('/api/health', (_req, res) => {
     service: 'pollen-forecast-api',
     time: new Date().toISOString(),
   });
+});
+
+app.get('/api/regions', async (_req, res) => {
+  const cacheKey = 'regional-forecast:v2';
+  const cached = cache.get(cacheKey);
+  if (cached && Date.now() - cached.created < 4 * 60 * 60 * 1000) {
+    res.json({ ...cached.value, cached: true });
+    return;
+  }
+
+  try {
+    const value = await buildRegionalForecast();
+    cache.set(cacheKey, { created: Date.now(), value });
+    res.json(value);
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
 });
 
 app.get('/api/forecast', async (req, res) => {
@@ -1020,6 +1435,42 @@ app.get('/api/forecast', async (req, res) => {
     res.json(value);
   } catch (error) {
     res.status(502).json({ error: error.message });
+  }
+});
+
+app.get('/api/spatial', async (req, res) => {
+  const bounds = {
+    north: clamp(parseCoord(req.query.north, 51.7), -90, 90),
+    south: clamp(parseCoord(req.query.south, 51.3), -90, 90),
+    east: clamp(parseCoord(req.query.east, 0.15), -180, 180),
+    west: clamp(parseCoord(req.query.west, -0.35), -180, 180),
+  };
+  const zoom = clamp(parseCoord(req.query.zoom, 5), 0, 20);
+  if (bounds.south > bounds.north || bounds.west > bounds.east) {
+    res.status(400).json({ error: 'Invalid map bounds' });
+    return;
+  }
+  const tier = spatialTierForZoom(zoom);
+  const cacheKey = [
+    'spatial-v1',
+    tier,
+    roundCoord(bounds.north),
+    roundCoord(bounds.south),
+    roundCoord(bounds.east),
+    roundCoord(bounds.west),
+  ].join(':');
+  const cached = cache.get(cacheKey);
+  if (cached && Date.now() - cached.created < 4 * 60 * 60 * 1000) {
+    res.json({ ...cached.value, cached: true });
+    return;
+  }
+
+  try {
+    const value = await buildSpatialForecast(bounds, zoom);
+    cache.set(cacheKey, { created: Date.now(), value });
+    res.json(value);
+  } catch (error) {
+    res.status(error.message.includes('zoom in') ? 400 : 502).json({ error: error.message });
   }
 });
 

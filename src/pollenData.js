@@ -8,7 +8,7 @@ const OPEN_METEO_POLLEN = [
 ];
 
 const CATEGORY_DEFS = {
-  aggregate: { label: 'All pollen', type: 'aggregate' },
+  aggregate: { label: 'Worst', type: 'aggregate' },
   grass: { label: 'Grass', type: 'family' },
   tree: { label: 'Tree', type: 'family' },
   weed: { label: 'Weed', type: 'family' },
@@ -490,11 +490,11 @@ function statusProvider(id, name, error) {
 
 function synthesize(providers) {
   const ensemble = {};
-  const present = new Set(['aggregate']);
+  const present = new Set();
 
   for (const provider of providers) {
     for (const category of Object.keys(provider.categories || {})) {
-      present.add(category);
+      if (category !== 'aggregate') present.add(category);
     }
   }
 
@@ -528,6 +528,23 @@ function synthesize(providers) {
       index: Number(weightedIndex.toFixed(2)),
       signalCount: signals.length,
       signals,
+    };
+  }
+
+  const familyScores = ['grass', 'tree', 'weed']
+    .map((category) => ensemble[category])
+    .filter(Boolean);
+  if (familyScores.length > 0) {
+    const worst = familyScores.reduce(
+      (highest, category) => (category.score > highest.score ? category : highest),
+      familyScores[0],
+    );
+    ensemble.aggregate = {
+      ...worst,
+      key: 'aggregate',
+      label: categoryName('aggregate'),
+      type: 'aggregate',
+      dominantCategory: worst.key,
     };
   }
 
@@ -583,7 +600,7 @@ async function buildBrowserForecast(lat, lng) {
       'Open-Meteo uses the CAMS model family, so CAMS is not counted as a separate ensemble member.',
       'Austrian Pollen Information Service data is available through the configured API backend in its supported countries.',
       'Met Office pollen is available through the configured API backend for UK locations.',
-      'All pollen uses each source’s highest grass, tree, or weed severity, then confidence-weights the source scores.',
+      'Worst is the highest confidence-weighted ensemble score among grass, tree, and weed.',
       'GitHub Pages is static; configure VITE_API_BASE_URL for server-side provider access.',
     ],
     staticMode: !HAS_API_BASE && !USE_LOCAL_API,
@@ -719,6 +736,23 @@ async function fetchApiJson(path, params, signal) {
 export function fetchForecast({ lat, lng, signal }) {
   if (HAS_API_BASE || USE_LOCAL_API) return fetchApiJson('/api/forecast', { lat, lng }, signal);
   return buildBrowserForecast(lat, lng);
+}
+
+export function fetchRegions({ signal } = {}) {
+  if (HAS_API_BASE || USE_LOCAL_API) return fetchApiJson('/api/regions', {}, signal);
+  throw new Error('The regional ensemble requires the API backend.');
+}
+
+export function fetchSpatial({ bounds, zoom, signal }) {
+  if (HAS_API_BASE || USE_LOCAL_API) {
+    return fetchApiJson('/api/spatial', {
+      ...Object.fromEntries(
+        Object.entries(bounds).map(([key, value]) => [key, String(Number(value).toFixed(5))]),
+      ),
+      zoom: String(Number(zoom).toFixed(2)),
+    }, signal);
+  }
+  throw new Error('Adaptive spatial pollen cells require the API backend.');
 }
 
 export function fetchGrid({ bounds, category, horizonHours = MAX_TIMELAPSE_HOURS, signal }) {
