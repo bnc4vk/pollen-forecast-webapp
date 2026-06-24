@@ -6,6 +6,7 @@ import {
   ChevronDown,
   CloudRain,
   Database,
+  Info,
   Pause,
   Play,
   Search,
@@ -89,8 +90,8 @@ function blendChannel(a, b, t) {
   return Math.round(a + (b - a) * t);
 }
 
-function concentrationColor(value, max, alpha = 0.62) {
-  if (!Number.isFinite(value) || value <= LOW_COLOR_THRESHOLD) {
+function scoreColor(score, alpha = 0.62) {
+  if (!Number.isFinite(score) || score <= LOW_COLOR_THRESHOLD) {
     return 'rgba(72, 155, 111, 0)';
   }
   const stops = [
@@ -100,8 +101,7 @@ function concentrationColor(value, max, alpha = 0.62) {
     { t: 0.7, color: [218, 92, 70] },
     { t: 1, color: [116, 73, 143] },
   ];
-  const usableMax = Math.max(max, LOW_COLOR_THRESHOLD + 1);
-  const t = max > LOW_COLOR_THRESHOLD ? clamp((value - LOW_COLOR_THRESHOLD) / (usableMax - LOW_COLOR_THRESHOLD), 0, 1) : 0;
+  const t = clamp((score - LOW_COLOR_THRESHOLD) / (100 - LOW_COLOR_THRESHOLD), 0, 1);
   const upperIndex = stops.findIndex((stop) => stop.t >= t);
   const upper = stops[upperIndex === -1 ? stops.length - 1 : upperIndex];
   const lower = stops[Math.max(0, (upperIndex === -1 ? stops.length - 1 : upperIndex) - 1)];
@@ -149,20 +149,52 @@ function frameScore(frame) {
   return Number(average.toFixed(1));
 }
 
-function activeFrameFor(gridData, offset) {
+function interpolatedFrameFor(gridData, progress) {
   if (!gridData?.frames?.length) return null;
-  return (
-    gridData.frames.find((frame) => frame.offsetHours === offset) ||
-    gridData.frames[0]
-  );
+  const maxOffset = gridData.frames.length - 1;
+  const safeProgress = clamp(Number(progress) || 0, 0, maxOffset);
+  const lowerIndex = Math.floor(safeProgress);
+  const upperIndex = Math.min(Math.ceil(safeProgress), maxOffset);
+  const mix = safeProgress - lowerIndex;
+  const lower = gridData.frames[lowerIndex];
+  const upper = gridData.frames[upperIndex] || lower;
+  const points = lower.points.map((point, index) => {
+    const nextPoint = upper.points[index] || point;
+    return {
+      lat: point.lat,
+      lng: point.lng,
+      value: point.value + (nextPoint.value - point.value) * mix,
+      score: point.score + (nextPoint.score - point.score) * mix,
+    };
+  });
+  const values = points.map((point) => point.value);
+  const lowerTime = lower.time ? new Date(lower.time).getTime() : null;
+  const upperTime = upper.time ? new Date(upper.time).getTime() : lowerTime;
+  const interpolatedTime =
+    Number.isFinite(lowerTime) && Number.isFinite(upperTime)
+      ? new Date(lowerTime + (upperTime - lowerTime) * mix).toISOString()
+      : lower.time;
+
+  return {
+    offsetHours: safeProgress,
+    time: interpolatedTime,
+    min: Number(Math.min(...values).toFixed(2)),
+    max: Number(Math.max(...values).toFixed(2)),
+    points,
+  };
 }
 
-function formatFrameTime(time) {
+function formatFrameTime(time, intervalMinutes = 1) {
   if (!time) return '';
+  const date = new Date(time);
+  if (intervalMinutes > 1) {
+    const intervalMs = intervalMinutes * 60 * 1000;
+    date.setTime(Math.round(date.getTime() / intervalMs) * intervalMs);
+  }
   return new Intl.DateTimeFormat(undefined, {
     hour: 'numeric',
     minute: '2-digit',
-  }).format(new Date(time));
+  }).format(date);
 }
 
 function displayStatus(status) {
@@ -382,7 +414,7 @@ function PollenMap({
   selectedCategoryData,
   gridData,
   gridLoading,
-  timeOffset,
+  timeProgress,
   weather,
 }) {
   const mapNode = useRef(null);
@@ -391,11 +423,11 @@ function PollenMap({
   const overlayRef = useRef(null);
   const weatherOverlayRef = useRef(null);
   const [legendHelpOpen, setLegendHelpOpen] = useState(false);
-  const weatherImpact = useMemo(
-    () => weatherProminence(weather, selectedCategoryData?.score),
-    [weather, selectedCategoryData?.score],
+  const activeFrame = useMemo(
+    () => interpolatedFrameFor(gridData, timeProgress),
+    [gridData, timeProgress],
   );
-  const activeFrame = useMemo(() => activeFrameFor(gridData, timeOffset), [gridData, timeOffset]);
+  const mapScore = useMemo(() => frameScore(activeFrame), [activeFrame]);
   const activeGridData = useMemo(() => {
     if (!gridData) return null;
     if (!activeFrame) return gridData;
@@ -403,7 +435,7 @@ function PollenMap({
       ...gridData,
       ...activeFrame,
       min: activeFrame.min,
-      max: Math.max(gridData.max || 0, activeFrame.max || 0),
+      max: activeFrame.max,
       frameMax: activeFrame.max,
       frameMin: activeFrame.min,
     };
@@ -411,15 +443,17 @@ function PollenMap({
   const gridIsCurrent = gridData?.category === selectedCategory;
   const gridIsFlatZero = gridIsCurrent && activeGridData && activeGridData.min === 0 && activeGridData.frameMax === 0;
   const hasEnsembleScore = Number(selectedCategoryData?.score) > 0;
-  const hasVisibleLayer = gridIsCurrent && activeGridData && (activeGridData.frameMax ?? activeGridData.max) > LOW_COLOR_THRESHOLD;
+  const hasVisibleLayer =
+    gridIsCurrent &&
+    activeGridData?.points?.some((point) => Number(point.score) > LOW_COLOR_THRESHOLD);
   const legendTooltip = selectedCategoryData
-    ? `${selectedCategoryData.score}/100 is a normalized exposure score from the available forecast sources. Weather inputs suggest ${weatherImpact.adjustedScore}/100 prominence, ${weatherImpact.direction} than the raw score. The map leaves 0-${LOW_COLOR_THRESHOLD} ${activeGridData?.units || 'grains/m3'} clear, then colors increasing concentrations. ${
+    ? `The top tile is the current-location composite (${selectedCategoryData.score}/100). This map number is the area-average CAMS forecast for the selected time. Map colors use the same fixed 0-100 scale: green is low, amber moderate, red high, and purple very high. ${
         gridLoading || !gridIsCurrent
           ? 'Updating map layer.'
           : gridIsFlatZero && hasEnsembleScore
             ? `No map color is shown because raw ${categoryLabel(selectedCategory).toLowerCase()} pollen amount is unavailable for this area.`
             : activeGridData
-              ? `Visible frame range: ${activeGridData.frameMin ?? activeGridData.min}-${activeGridData.frameMax ?? activeGridData.max} ${activeGridData.units}.`
+              ? `Current map average: ${mapScore ?? 0}/100.`
               : 'No concentration grid.'
       }`
     : 'The category score and map scale will appear when forecast data loads.';
@@ -442,11 +476,77 @@ function PollenMap({
       attributionControl: true,
     }).setView([location.lat, location.lng], DEFAULT_ZOOM);
 
-    L.control.zoom({ position: 'bottomright' }).addTo(map);
+    map.attributionControl.setPrefix(false);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
       attribution: '&copy; OpenStreetMap contributors',
     }).addTo(map);
+
+    const PollenLayer = L.Layer.extend({
+      onAdd(activeMap) {
+        this._map = activeMap;
+        this._canvas = L.DomUtil.create('canvas', 'pollen-canvas');
+        this._canvas.setAttribute('aria-hidden', 'true');
+        activeMap.getPanes().overlayPane.appendChild(this._canvas);
+        activeMap.on('move zoom resize viewreset', this._draw, this);
+        this._draw();
+      },
+      onRemove(activeMap) {
+        activeMap.off('move zoom resize viewreset', this._draw, this);
+        this._canvas?.remove();
+      },
+      setData(data) {
+        this._data = data;
+        this._draw();
+      },
+      _draw() {
+        if (!this._map || !this._canvas) return;
+        const mapSize = this._map.getSize();
+        const topLeft = this._map.containerPointToLayerPoint([0, 0]);
+        const canvas = this._canvas;
+        const dpr = window.devicePixelRatio || 1;
+        const pixelWidth = Math.round(mapSize.x * dpr);
+        const pixelHeight = Math.round(mapSize.y * dpr);
+
+        L.DomUtil.setPosition(canvas, topLeft);
+        if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+          canvas.width = pixelWidth;
+          canvas.height = pixelHeight;
+          canvas.style.width = `${mapSize.x}px`;
+          canvas.style.height = `${mapSize.y}px`;
+        }
+
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, mapSize.x, mapSize.y);
+        const data = this._data;
+        if (!data?.points?.length) return;
+
+        const radius =
+          Math.max(mapSize.x / (data.cols || 8), mapSize.y / (data.rows || 8)) * 1.45;
+        for (const point of data.points) {
+          if (point.score <= LOW_COLOR_THRESHOLD) continue;
+          const pixel = this._map.latLngToContainerPoint([point.lat, point.lng]);
+          const gradient = ctx.createRadialGradient(
+            pixel.x,
+            pixel.y,
+            0,
+            pixel.x,
+            pixel.y,
+            radius,
+          );
+          gradient.addColorStop(0, scoreColor(point.score, 0.62));
+          gradient.addColorStop(0.58, scoreColor(point.score, 0.3));
+          gradient.addColorStop(1, scoreColor(point.score, 0));
+          ctx.fillStyle = gradient;
+          ctx.beginPath();
+          ctx.arc(pixel.x, pixel.y, radius, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      },
+    });
+
+    overlayRef.current = new PollenLayer().addTo(map);
 
     const emitMapState = () => {
       const next = map.getCenter();
@@ -464,6 +564,7 @@ function PollenMap({
     return () => {
       map.remove();
       mapRef.current = null;
+      overlayRef.current = null;
     };
   }, []);
 
@@ -506,72 +607,8 @@ function PollenMap({
   }, [searchLocation]);
 
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    if (overlayRef.current) {
-      overlayRef.current.remove();
-      overlayRef.current = null;
-    }
-
-    if (!activeGridData?.points?.length || (activeGridData.frameMax ?? activeGridData.max) <= LOW_COLOR_THRESHOLD) return;
-
-    const PollenLayer = L.Layer.extend({
-      onAdd(activeMap) {
-        this._map = activeMap;
-        this._canvas = L.DomUtil.create('canvas', 'pollen-canvas');
-        this._canvas.setAttribute('aria-hidden', 'true');
-        activeMap.getPanes().overlayPane.appendChild(this._canvas);
-        activeMap.on('move zoom resize viewreset', this._draw, this);
-        this._draw();
-      },
-      onRemove(activeMap) {
-        activeMap.off('move zoom resize viewreset', this._draw, this);
-        this._canvas?.remove();
-      },
-      _draw() {
-        const size = map.getSize();
-        const topLeft = map.containerPointToLayerPoint([0, 0]);
-        const canvas = this._canvas;
-        const dpr = window.devicePixelRatio || 1;
-
-        L.DomUtil.setPosition(canvas, topLeft);
-        canvas.width = size.x * dpr;
-        canvas.height = size.y * dpr;
-        canvas.style.width = `${size.x}px`;
-        canvas.style.height = `${size.y}px`;
-
-        const ctx = canvas.getContext('2d');
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.clearRect(0, 0, size.x, size.y);
-        ctx.globalCompositeOperation = 'source-over';
-
-        const radius = Math.max(size.x / (activeGridData.cols || 8), size.y / (activeGridData.rows || 8)) * 1.45;
-        const max = Math.max(activeGridData.max || 0, LOW_COLOR_THRESHOLD + 1);
-        const weatherAlpha = clamp(weatherImpact.multiplier, 0.72, 1.22);
-
-        for (const point of activeGridData.points) {
-          if (point.value <= LOW_COLOR_THRESHOLD) continue;
-          const pixel = map.latLngToContainerPoint([point.lat, point.lng]);
-          const gradient = ctx.createRadialGradient(pixel.x, pixel.y, 0, pixel.x, pixel.y, radius);
-          gradient.addColorStop(0, concentrationColor(point.value, max, 0.54 * weatherAlpha));
-          gradient.addColorStop(0.58, concentrationColor(point.value, max, 0.25 * weatherAlpha));
-          gradient.addColorStop(1, concentrationColor(point.value, max, 0));
-          ctx.fillStyle = gradient;
-          ctx.beginPath();
-          ctx.arc(pixel.x, pixel.y, radius, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      },
-    });
-
-    overlayRef.current = new PollenLayer().addTo(map);
-
-    return () => {
-      overlayRef.current?.remove();
-      overlayRef.current = null;
-    };
-  }, [activeGridData, weatherImpact.multiplier]);
+    overlayRef.current?.setData(gridIsCurrent ? activeGridData : null);
+  }, [activeGridData, gridIsCurrent]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -713,12 +750,9 @@ function PollenMap({
           <div>
             <p className="toolbar-value">
               {selectedCategoryData
-                ? `${categoryLabel(selectedCategory)} ${selectedCategoryData.score}/100`
+                ? `${categoryLabel(selectedCategory)} map ${mapScore ?? '—'}/100`
                 : `${categoryLabel(selectedCategory)} score pending`}
             </p>
-            {selectedCategoryData && (
-              <span className="legend-adjusted">Weather {weatherImpact.adjustedScore}/100</span>
-            )}
           </div>
           <span className={`legend-ramp ${!hasVisibleLayer ? 'flat' : ''}`} aria-hidden="true" />
         </div>
@@ -729,7 +763,6 @@ function PollenMap({
 
 function TimelapseControls({
   horizon,
-  offset,
   progress,
   playing,
   loading,
@@ -738,13 +771,24 @@ function TimelapseControls({
   onOffsetChange,
   onPlayingChange,
 }) {
-  const offsetLabel = offset === 0 ? 'Now' : `+${offset}h`;
+  const roundedMinutes = Math.round((progress * 60) / 15) * 15;
+  const offsetLabel =
+    roundedMinutes === 0
+      ? 'Now'
+      : roundedMinutes < 60
+        ? `+${roundedMinutes}m`
+      : roundedMinutes % 60 === 0
+        ? `+${roundedMinutes / 60}h`
+        : `+${Math.floor(roundedMinutes / 60)}h ${roundedMinutes % 60}m`;
   const progressPercent = horizon > 0 ? clamp((progress / horizon) * 100, 0, 100) : 0;
   return (
     <div className="timelapse-panel" aria-label="Timelapse forecast controls">
       <div className="panel-title">
         <span>Timelapse</span>
-        <strong>{offsetLabel}{frame?.time ? ` · ${formatFrameTime(frame.time)}` : ''}</strong>
+        <strong>
+          {offsetLabel}
+          {frame?.time ? ` · ${formatFrameTime(frame.time, 15)}` : ''}
+        </strong>
       </div>
       <div className="timelapse-actions">
         <button
@@ -780,8 +824,8 @@ function TimelapseControls({
           type="range"
           min="0"
           max={horizon}
-          step="1"
-          value={Math.min(offset, horizon)}
+          step="0.05"
+          value={Math.min(progress, horizon)}
           onChange={(event) => onOffsetChange(Number(event.target.value))}
           disabled={loading}
         />
@@ -1018,6 +1062,9 @@ function LocationSearch({ onSelect }) {
 }
 
 function CategoryTiles({ categories, selectedCategory, onSelect }) {
+  const [aggregateHelpOpen, setAggregateHelpOpen] = useState(false);
+  const aggregateExplanation =
+    'All pollen uses the highest grass, tree, or weed severity from each source, then confidence-weights those source scores. This avoids diluting one high allergen or inflating the result by adding unlike concentrations.';
   if (!categories?.length) {
     return (
       <section className="category-tiles" aria-label="Pollen category filters">
@@ -1030,19 +1077,52 @@ function CategoryTiles({ categories, selectedCategory, onSelect }) {
   }
 
   return (
-    <section className="category-tiles" aria-label="Pollen category filters">
-      {categories.map((category) => (
-        <button
-          className={`category-tile ${selectedCategory === category.key ? 'active' : ''}`}
-          type="button"
-          key={category.key}
-          onClick={() => onSelect(category.key)}
-        >
-          <span>{category.label}</span>
-          <strong>{category.score}/100</strong>
-        </button>
-      ))}
-    </section>
+    <>
+      <section className="category-tiles" aria-label="Pollen category filters">
+        {categories.map((category) => (
+          <button
+            className={`category-tile ${selectedCategory === category.key ? 'active' : ''}`}
+            type="button"
+            key={category.key}
+            onClick={(event) => {
+              if (category.key === 'aggregate' && event.target.closest('.score-info')) {
+                event.stopPropagation();
+                setAggregateHelpOpen((open) => !open);
+                return;
+              }
+              setAggregateHelpOpen(false);
+              onSelect(category.key);
+            }}
+            aria-describedby={category.key === 'aggregate' ? 'aggregate-score-explanation' : undefined}
+          >
+            <span className="category-label">
+              {category.label}
+              {category.key === 'aggregate' && (
+                <span
+                  className="score-info"
+                  aria-hidden="true"
+                  title="How the All pollen score is calculated"
+                  onMouseEnter={() => setAggregateHelpOpen(true)}
+                  onMouseLeave={() => setAggregateHelpOpen(false)}
+                >
+                  <Info size={13} aria-hidden="true" />
+                </span>
+              )}
+            </span>
+            <strong>{category.score}/100</strong>
+          </button>
+        ))}
+        <span className="sr-only" id="aggregate-score-explanation">
+          {aggregateExplanation}
+        </span>
+      </section>
+      {aggregateHelpOpen && (
+        <div className="aggregate-score-tooltip" role="tooltip">
+          <strong>How All pollen is calculated</strong>
+          <span>{aggregateExplanation}</span>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1060,7 +1140,6 @@ function App() {
   const [searchLocation, setSearchLocation] = useState(null);
   const [selectedPlaceLabel, setSelectedPlaceLabel] = useState('');
   const [timelapseHorizon, setTimelapseHorizon] = useState(3);
-  const [timeOffset, setTimeOffset] = useState(0);
   const [visualTimeOffset, setVisualTimeOffset] = useState(0);
   const [timelapsePlaying, setTimelapsePlaying] = useState(false);
   const [weather, setWeather] = useState(DEFAULT_WEATHER);
@@ -1068,25 +1147,11 @@ function App() {
   const [weatherError, setWeatherError] = useState('');
   const visualTimeOffsetRef = useRef(0);
 
-  const activeFrame = useMemo(() => activeFrameFor(gridData, timeOffset), [gridData, timeOffset]);
-  const activeFrameDisplayScore = useMemo(() => frameScore(activeFrame), [activeFrame]);
-  const selectedCategoryData = useMemo(() => {
-    const selected = forecast?.ensemble?.[selectedCategory];
-    if (!selected) return selected;
-    if (activeFrameDisplayScore === null) return selected;
-    return {
-      ...selected,
-      score: activeFrameDisplayScore,
-    };
-  }, [forecast, selectedCategory, activeFrameDisplayScore]);
-  const displayCategories = useMemo(() => {
-    if (!forecast?.categories?.length) return forecast?.categories;
-    return forecast.categories.map((category) => (
-      category.key === selectedCategory && activeFrameDisplayScore !== null
-        ? { ...category, score: activeFrameDisplayScore }
-        : category
-    ));
-  }, [forecast, selectedCategory, activeFrameDisplayScore]);
+  const activeFrame = useMemo(
+    () => interpolatedFrameFor(gridData, visualTimeOffset),
+    [gridData, visualTimeOffset],
+  );
+  const selectedCategoryData = forecast?.ensemble?.[selectedCategory];
   const weatherImpact = useMemo(
     () => weatherProminence(weather, selectedCategoryData?.score),
     [weather, selectedCategoryData?.score],
@@ -1183,7 +1248,6 @@ function App() {
   }, [forecastPoint, mapBounds]);
 
   useEffect(() => {
-    setTimeOffset(0);
     setVisualTimeOffset(0);
   }, [selectedCategory, timelapseHorizon]);
 
@@ -1193,34 +1257,47 @@ function App() {
 
   useEffect(() => {
     if (!timelapsePlaying) {
-      setVisualTimeOffset(timeOffset);
       return undefined;
     }
 
-    const cycleMs = Math.max(timelapseHorizon, 1) * 900;
-    const startTime = window.performance.now() - (visualTimeOffsetRef.current / Math.max(timelapseHorizon, 1)) * cycleMs;
+    const millisecondsPerHour = 1200;
+    const endHoldMs = 500;
+    let startTime = window.performance.now();
+    let startOffset = clamp(visualTimeOffsetRef.current, 0, timelapseHorizon);
     let frameId = 0;
 
     const tick = (now) => {
-      const elapsed = (now - startTime) % cycleMs;
-      const progress = (elapsed / cycleMs) * timelapseHorizon;
-      const nextOffset = Math.min(timelapseHorizon, Math.floor(progress + 0.001));
+      const elapsed = now - startTime;
+      const travelMs = Math.max((timelapseHorizon - startOffset) * millisecondsPerHour, 1);
+      let progress = startOffset + elapsed / millisecondsPerHour;
+
+      if (elapsed >= travelMs) {
+        progress = timelapseHorizon;
+        if (elapsed >= travelMs + endHoldMs) {
+          startTime = now;
+          startOffset = 0;
+          progress = 0;
+        }
+      }
+
       setVisualTimeOffset(progress);
-      setTimeOffset((current) => (current === nextOffset ? current : nextOffset));
       frameId = window.requestAnimationFrame(tick);
     };
 
     frameId = window.requestAnimationFrame(tick);
 
     return () => window.cancelAnimationFrame(frameId);
-  }, [timelapsePlaying, timelapseHorizon, timeOffset]);
+  }, [timelapsePlaying, timelapseHorizon]);
 
   return (
     <main className="app-shell">
       <CategoryTiles
-        categories={displayCategories}
+        categories={forecast?.categories}
         selectedCategory={selectedCategory}
-        onSelect={setSelectedCategory}
+        onSelect={(category) => {
+          setTimelapsePlaying(false);
+          setSelectedCategory(category);
+        }}
       />
       <PollenMap
         location={location}
@@ -1235,13 +1312,12 @@ function App() {
         selectedCategoryData={selectedCategoryData}
         gridData={gridData}
         gridLoading={gridLoading}
-        timeOffset={timeOffset}
+        timeProgress={visualTimeOffset}
         weather={weather}
       />
       <section className="map-control-panel" aria-label="Forecast playback and live weather">
         <TimelapseControls
           horizon={timelapseHorizon}
-          offset={timeOffset}
           progress={visualTimeOffset}
           playing={timelapsePlaying}
           loading={gridLoading || gridData?.category !== selectedCategory}
@@ -1252,7 +1328,6 @@ function App() {
           }}
           onOffsetChange={(offset) => {
             setTimelapsePlaying(false);
-            setTimeOffset(offset);
             setVisualTimeOffset(offset);
           }}
           onPlayingChange={setTimelapsePlaying}
@@ -1274,4 +1349,7 @@ function App() {
   );
 }
 
-createRoot(document.getElementById('root')).render(<App />);
+const rootElement = document.getElementById('root');
+const root = globalThis.__pollenForecastRoot || createRoot(rootElement);
+globalThis.__pollenForecastRoot = root;
+root.render(<App />);

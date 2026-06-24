@@ -141,7 +141,11 @@ function openMeteoCategoryValue(current, category) {
   };
 
   if (category === 'aggregate') {
-    return values.alder + values.birch + values.grass + values.mugwort + values.olive + values.ragweed;
+    return Math.max(
+      values.grass,
+      values.alder + values.birch + values.olive,
+      values.mugwort + values.ragweed,
+    );
   }
   if (category === 'tree') return values.alder + values.birch + values.olive;
   if (category === 'weed') return values.mugwort + values.ragweed;
@@ -309,11 +313,16 @@ async function fetchOpenMeteo(lat, lng) {
     });
   }
 
+  const dominantFamily = Object.entries(family).reduce(
+    (dominant, entry) => (entry[1] > dominant[1] ? entry : dominant),
+    ['grass', family.grass],
+  );
   categories.aggregate = makeSignal({
     category: 'aggregate',
-    value: family.grass + family.tree + family.weed,
+    value: dominantFamily[1],
+    index: Math.max(...Object.values(family).map(rawConcentrationToIndex)),
     units: 'grains/m3',
-    sourceDetail: 'Sum of Open-Meteo grass, tree, and weed pollen',
+    sourceDetail: `Highest Open-Meteo family severity (${categoryName(dominantFamily[0])})`,
     confidence: 0.82,
   });
 
@@ -379,12 +388,15 @@ async function fetchGooglePollen(lat, lng) {
 
   const familySignals = ['grass', 'tree', 'weed'].map((keyName) => categories[keyName]).filter(Boolean);
   if (familySignals.length > 0) {
-    const avg = familySignals.reduce((sum, signal) => sum + signal.index, 0) / familySignals.length;
+    const highest = familySignals.reduce(
+      (dominant, signal) => (signal.index > dominant.index ? signal : dominant),
+      familySignals[0],
+    );
     categories.aggregate = makeSignal({
       category: 'aggregate',
-      index: avg,
+      index: highest.index,
       units: 'UPI 0-5',
-      sourceDetail: 'Average of Google grass, tree, and weed UPI signals',
+      sourceDetail: `Highest Google family severity (${highest.label})`,
       confidence: 0.76,
     });
   }
@@ -409,6 +421,14 @@ async function fetchTomorrow(lat, lng) {
       'needs-backend',
       ['Tomorrow.io needs VITE_API_BASE_URL on GitHub Pages so the API key stays server-side.'],
       'Tomorrow.io is disabled on this static deployment until an API backend is configured.',
+    );
+  }
+  if (import.meta.env.VITE_ENABLE_TOMORROW_POLLEN !== 'true') {
+    return emptyProvider(
+      'tomorrow',
+      'Tomorrow.io',
+      'disabled-premium',
+      ['Pollen is a Tomorrow.io premium layer and is disabled until entitlement is confirmed.'],
     );
   }
 
@@ -437,12 +457,15 @@ async function fetchTomorrow(lat, lng) {
 
   const familySignals = ['grass', 'tree', 'weed'].map((keyName) => categories[keyName]).filter(Boolean);
   if (familySignals.length > 0) {
-    const avg = familySignals.reduce((sum, signal) => sum + signal.index, 0) / familySignals.length;
+    const highest = familySignals.reduce(
+      (dominant, signal) => (signal.index > dominant.index ? signal : dominant),
+      familySignals[0],
+    );
     categories.aggregate = makeSignal({
       category: 'aggregate',
-      index: avg,
+      index: highest.index,
       units: 'index 0-5',
-      sourceDetail: 'Average of Tomorrow.io grass, tree, and weed indices',
+      sourceDetail: `Highest Tomorrow.io family severity (${highest.label})`,
       confidence: 0.72,
     });
   }
@@ -515,15 +538,33 @@ async function buildBrowserForecast(lat, lng) {
   const settled = await Promise.allSettled([
     fetchOpenMeteo(lat, lng),
     fetchGooglePollen(lat, lng),
-    fetchTomorrow(lat, lng),
   ]);
 
   const providers = settled.map((result, index) => {
     if (result.status === 'fulfilled') return result.value;
     if (index === 0) return statusProvider('openmeteo', 'Open-Meteo / CAMS', result.reason);
-    if (index === 1) return statusProvider('google', 'Google Pollen API', result.reason);
-    return statusProvider('tomorrow', 'Tomorrow.io', result.reason);
+    return statusProvider('google', 'Google Pollen API', result.reason);
   });
+  providers.splice(
+    2,
+    0,
+    emptyProvider(
+      'polleninformation',
+      'Austrian Pollen Information Service',
+      'backend-required',
+      ['The Austrian official feed is enabled through the API backend in its supported countries.'],
+    ),
+  );
+  providers.splice(
+    3,
+    0,
+    emptyProvider(
+      'metoffice',
+      'Met Office Pollen',
+      'backend-required',
+      ['The Met Office regional feed is enabled through the API backend.'],
+    ),
+  );
 
   const ensemble = synthesize(providers);
   const categories = Object.values(ensemble).sort((a, b) => {
@@ -540,7 +581,10 @@ async function buildBrowserForecast(lat, lng) {
     providers,
     caveats: [
       'Open-Meteo uses the CAMS model family, so CAMS is not counted as a separate ensemble member.',
-      'GitHub Pages is static; configure VITE_API_BASE_URL for server-side Google and Tomorrow.io provider access.',
+      'Austrian Pollen Information Service data is available through the configured API backend in its supported countries.',
+      'Met Office pollen is available through the configured API backend for UK locations.',
+      'All pollen uses each source’s highest grass, tree, or weed severity, then confidence-weights the source scores.',
+      'GitHub Pages is static; configure VITE_API_BASE_URL for server-side provider access.',
     ],
     staticMode: !HAS_API_BASE && !USE_LOCAL_API,
   };

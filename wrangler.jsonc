@@ -7,6 +7,7 @@
     "enabled": true
   },
   "vars": {
-    "ALLOWED_ORIGIN": "https://bnc4vk.github.io,http://localhost:5173,http://127.0.0.1:5173"
+    "ALLOWED_ORIGIN": "https://bnc4vk.github.io,http://localhost:5173,http://127.0.0.1:5173",
+    "ENABLE_TOMORROW_POLLEN": "false"
   }
 }

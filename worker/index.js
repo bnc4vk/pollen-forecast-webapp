@@ -1,3 +1,5 @@
+import { iso1A2Code } from '@rapideditor/country-coder';
+
 const OPEN_METEO_POLLEN = [
   'alder_pollen',
   'birch_pollen',
@@ -39,9 +41,62 @@ const TOMORROW_FIELD_MAP = {
   treeIndex: 'tree',
   weedIndex: 'weed',
 };
+const MET_OFFICE_POLLEN_URL =
+  'https://weather.metoffice.gov.uk/warnings-and-advice/seasonal-advice/pollen-forecast';
+const POLLENINFORMATION_URL = 'https://www.polleninformation.at/api/forecast/public';
+const POLLENINFORMATION_CACHE_SECONDS = 4 * 60 * 60;
+const POLLENINFORMATION_COUNTRIES = new Set([
+  'AT',
+  'CH',
+  'DE',
+  'ES',
+  'FR',
+  'GB',
+  'IT',
+  'LV',
+  'LT',
+  'PL',
+  'SE',
+  'TR',
+  'UA',
+]);
+const POLLENINFORMATION_SPECIES = {
+  1: 'alder',
+  2: 'birch',
+  5: 'grass',
+  6: 'ragweed',
+  7: 'mugwort',
+  18: 'olive',
+};
+const POLLENINFORMATION_FAMILIES = {
+  grass: [5, 291],
+  tree: [1, 2, 3, 4, 16, 17, 18, 326, 355, 1107],
+  weed: [6, 7, 15, 320, 356],
+};
+const MET_OFFICE_REGIONS = [
+  { id: 'os', name: 'Orkney & Shetland', lat: 59.26, lng: -2.57 },
+  { id: 'he', name: 'Highlands & Eilean Siar', lat: 57.521, lng: -5.152 },
+  { id: 'gr', name: 'Grampian', lat: 57.436, lng: -2.449 },
+  { id: 'ta', name: 'Central, Tayside & Fife', lat: 56.462, lng: -3.68 },
+  { id: 'st', name: 'Strathclyde', lat: 56.133, lng: -5.311 },
+  { id: 'dg', name: 'Dumfries, Galloway, Lothian & Borders', lat: 55.668, lng: -2.85 },
+  { id: 'ne', name: 'North East England', lat: 55.057, lng: -1.845 },
+  { id: 'ni', name: 'Northern Ireland', lat: 54.786, lng: -6.652 },
+  { id: 'yh', name: 'Yorkshire & Humber', lat: 54.062, lng: -1.142 },
+  { id: 'nw', name: 'North West England', lat: 53.904, lng: -2.944 },
+  { id: 'em', name: 'East Midlands', lat: 53.082, lng: -0.716 },
+  { id: 'wm', name: 'West Midlands', lat: 52.551, lng: -2.296 },
+  { id: 'wl', name: 'Wales', lat: 52.462, lng: -3.749 },
+  { id: 'ee', name: 'East of England', lat: 52.31, lng: 0.895 },
+  { id: 'se', name: 'London & South East England', lat: 51.086, lng: -0.409 },
+  { id: 'sw', name: 'South West England', lat: 50.899, lng: -3.444 },
+];
 const MAX_TIMELAPSE_HOURS = 8;
 const WEATHER_GRID_ROWS = 4;
 const WEATHER_GRID_COLS = 4;
+const pollenInformationMemoryCache = new Map();
+const pollenInformationPending = new Map();
+let metOfficePageCache = null;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -129,6 +184,123 @@ async function fetchJson(url, { timeoutMs = 10000 } = {}) {
   }
 }
 
+async function fetchText(url, { timeoutMs = 10000 } = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'pollen-forecast-webapp/1.0' },
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 180)}`);
+    return text;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchMetOfficePage() {
+  if (metOfficePageCache && Date.now() - metOfficePageCache.created < 30 * 60 * 1000) {
+    return metOfficePageCache.html;
+  }
+  const html = await fetchText(MET_OFFICE_POLLEN_URL);
+  metOfficePageCache = { created: Date.now(), html };
+  return html;
+}
+
+function decodeHtml(value) {
+  return value
+    .replaceAll('&amp;', '&')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .replace(/<[^>]+>/g, '')
+    .trim();
+}
+
+function metOfficeIndex(label) {
+  return { low: 1, moderate: 2.5, high: 4, 'very high': 5 }[label.toLowerCase()];
+}
+
+function nearestMetOfficeRegion(lat, lng) {
+  if (lat < 49 || lat > 61 || lng < -9 || lng > 2.2) return null;
+  const lngScale = Math.cos((lat * Math.PI) / 180);
+  return MET_OFFICE_REGIONS.reduce((nearest, region) => {
+    const distance = (lat - region.lat) ** 2 + ((lng - region.lng) * lngScale) ** 2;
+    return !nearest || distance < nearest.distance ? { ...region, distance } : nearest;
+  }, null);
+}
+
+function metOfficeCard(html, regionId) {
+  const startMarker = `<div id="${regionId}" class="pollen-forecast-card"`;
+  const start = html.indexOf(startMarker);
+  if (start < 0) return '';
+  const next = html.indexOf('class="pollen-forecast-card"', start + startMarker.length);
+  return html.slice(start, next < 0 ? html.length : html.lastIndexOf('<div id="', next));
+}
+
+function pollenInformationCountry(lat, lng) {
+  const country = iso1A2Code([Number(lng), Number(lat)]);
+  return POLLENINFORMATION_COUNTRIES.has(country) ? country : null;
+}
+
+function pollenInformationCacheKey(country, lat, lng) {
+  return `https://pollen-cache.invalid/${country.toLowerCase()}/${Number(lat).toFixed(1)}/${Number(lng).toFixed(1)}`;
+}
+
+async function fetchCachedPollenInformation(country, lat, lng, apiKey) {
+  const cacheKey = pollenInformationCacheKey(country, lat, lng);
+  const memoryCached = pollenInformationMemoryCache.get(cacheKey);
+  if (memoryCached && Date.now() - memoryCached.created < POLLENINFORMATION_CACHE_SECONDS * 1000) {
+    return { data: memoryCached.data, cacheStatus: 'four-hour cache' };
+  }
+
+  const cacheRequest = new Request(cacheKey);
+  const cacheStorage = typeof caches === 'undefined' ? null : caches.default;
+  const cached = cacheStorage ? await cacheStorage.match(cacheRequest) : null;
+  if (cached) {
+    const data = await cached.json();
+    pollenInformationMemoryCache.set(cacheKey, { created: Date.now(), data });
+    return { data, cacheStatus: 'four-hour cache' };
+  }
+
+  let pending = pollenInformationPending.get(cacheKey);
+  let cacheStatus = 'fresh';
+  if (!pending) {
+    const params = new URLSearchParams({
+      country,
+      lang: 'en',
+      latitude: Number(lat).toFixed(5),
+      longitude: Number(lng).toFixed(5),
+      apikey: apiKey,
+    });
+    pending = fetchJson(`${POLLENINFORMATION_URL}?${params}`, { timeoutMs: 12000 })
+      .then((nextData) => {
+        if (nextData.error) throw new Error(`Austrian pollen API: ${nextData.error}`);
+        pollenInformationMemoryCache.set(cacheKey, { created: Date.now(), data: nextData });
+        return nextData;
+      })
+      .finally(() => pollenInformationPending.delete(cacheKey));
+    pollenInformationPending.set(cacheKey, pending);
+  } else {
+    cacheStatus = 'shared request';
+  }
+  const data = await pending;
+
+  if (cacheStorage) {
+    await cacheStorage.put(
+      cacheRequest,
+      new Response(JSON.stringify(data), {
+        headers: {
+          'Cache-Control': `public, max-age=${POLLENINFORMATION_CACHE_SECONDS}`,
+          'Content-Type': 'application/json',
+        },
+      }),
+    );
+  }
+  return { data, cacheStatus };
+}
+
 function findCurrentOpenMeteoValues(data) {
   if (data.current) return data.current;
 
@@ -162,7 +334,11 @@ function openMeteoCategoryValue(current, category) {
   };
 
   if (category === 'aggregate') {
-    return values.alder + values.birch + values.grass + values.mugwort + values.olive + values.ragweed;
+    return Math.max(
+      values.grass,
+      values.alder + values.birch + values.olive,
+      values.mugwort + values.ragweed,
+    );
   }
   if (category === 'tree') return values.alder + values.birch + values.olive;
   if (category === 'weed') return values.mugwort + values.ragweed;
@@ -326,11 +502,16 @@ async function fetchOpenMeteo(lat, lng) {
     });
   }
 
+  const dominantFamily = Object.entries(family).reduce(
+    (dominant, entry) => (entry[1] > dominant[1] ? entry : dominant),
+    ['grass', family.grass],
+  );
   categories.aggregate = makeSignal({
     category: 'aggregate',
-    value: family.grass + family.tree + family.weed,
+    value: dominantFamily[1],
+    index: Math.max(...Object.values(family).map(rawConcentrationToIndex)),
     units: 'grains/m3',
-    sourceDetail: 'Sum of Open-Meteo grass, tree, and weed pollen',
+    sourceDetail: `Highest Open-Meteo family severity (${categoryName(dominantFamily[0])})`,
     confidence: 0.82,
   });
 
@@ -388,12 +569,15 @@ async function fetchGooglePollen(lat, lng, env) {
 
   const familySignals = ['grass', 'tree', 'weed'].map((keyName) => categories[keyName]).filter(Boolean);
   if (familySignals.length > 0) {
-    const avg = familySignals.reduce((sum, signal) => sum + signal.index, 0) / familySignals.length;
+    const highest = familySignals.reduce(
+      (dominant, signal) => (signal.index > dominant.index ? signal : dominant),
+      familySignals[0],
+    );
     categories.aggregate = makeSignal({
       category: 'aggregate',
-      index: avg,
+      index: highest.index,
       units: 'UPI 0-5',
-      sourceDetail: 'Average of Google grass, tree, and weed UPI signals',
+      sourceDetail: `Highest Google family severity (${highest.label})`,
       confidence: 0.76,
     });
   }
@@ -409,9 +593,154 @@ async function fetchGooglePollen(lat, lng, env) {
   };
 }
 
+async function fetchPollenInformation(lat, lng, env) {
+  const key = env.POLLENINFORMATION_API_KEY;
+  if (!key) {
+    return emptyProvider('polleninformation', 'Austrian Pollen Information Service', 'missing-key', [
+      'POLLENINFORMATION_API_KEY is not set.',
+    ]);
+  }
+  const country = pollenInformationCountry(lat, lng);
+  if (!country) {
+    return emptyProvider('polleninformation', 'Austrian Pollen Information Service', 'outside-coverage', [
+      'This location is outside the countries supported by the Pollen Information API.',
+    ]);
+  }
+
+  const { data, cacheStatus } = await fetchCachedPollenInformation(country, lat, lng, key);
+  const loads = new Map(
+    (data.contamination || []).map((item) => [
+      Number(item.poll_id),
+      {
+        load: clamp(Number(item.contamination_1) || 0, 0, 4),
+        title: item.poll_title || `Allergen ${item.poll_id}`,
+      },
+    ]),
+  );
+  const categories = {};
+
+  for (const [pollId, category] of Object.entries(POLLENINFORMATION_SPECIES)) {
+    const allergen = loads.get(Number(pollId));
+    if (!allergen) continue;
+    categories[category] = makeSignal({
+      category,
+      value: allergen.load,
+      index: allergen.load * 1.25,
+      units: 'load 0-4',
+      sourceDetail: `${allergen.title}: ${allergen.load}/4`,
+      confidence: 0.88,
+    });
+  }
+
+  for (const [category, pollIds] of Object.entries(POLLENINFORMATION_FAMILIES)) {
+    const allergens = pollIds.map((pollId) => loads.get(pollId)).filter(Boolean);
+    if (allergens.length === 0) continue;
+    const dominant = allergens.reduce(
+      (highest, allergen) => (allergen.load > highest.load ? allergen : highest),
+      allergens[0],
+    );
+    categories[category] = makeSignal({
+      category,
+      value: dominant.load,
+      index: dominant.load * 1.25,
+      units: 'load 0-4',
+      sourceDetail: `${dominant.title}: ${dominant.load}/4`,
+      confidence: 0.9,
+    });
+  }
+
+  const familySignals = ['grass', 'tree', 'weed'].map((category) => categories[category]).filter(Boolean);
+  if (familySignals.length > 0) {
+    const dominant = familySignals.reduce(
+      (highest, signal) => (signal.index > highest.index ? signal : highest),
+      familySignals[0],
+    );
+    categories.aggregate = makeSignal({
+      category: 'aggregate',
+      value: dominant.value,
+      index: dominant.index,
+      units: 'load 0-4',
+      sourceDetail: `Highest Austrian family severity (${dominant.label}: ${dominant.value}/4)`,
+      confidence: 0.9,
+    });
+  }
+
+  const allergyRisk = clamp(Number(data.allergyrisk?.allergyrisk_1) || 0, 0, 10);
+  return {
+    id: 'polleninformation',
+    name: 'Austrian Pollen Information Service',
+    status: 'ok',
+    modelFamily: 'Austrian Pollen Information Service',
+    categories,
+    receivedAt: new Date().toISOString(),
+    notes: [
+      `Country ${country}; today’s allergy risk: ${allergyRisk}/10; response: ${cacheStatus}.`,
+      'Source: Austrian Pollen Information Service, www.polleninformation.at.',
+      'Licensed for non-commercial use; upstream retrieval is limited to once per four hours per cached area.',
+    ],
+  };
+}
+
+async function fetchMetOfficePollen(lat, lng) {
+  const region = nearestMetOfficeRegion(lat, lng);
+  if (!region) {
+    return emptyProvider('metoffice', 'Met Office Pollen', 'outside-coverage', [
+      'The Met Office pollen model covers the United Kingdom only.',
+    ]);
+  }
+  const html = await fetchMetOfficePage();
+  const card = metOfficeCard(html, region.id);
+  const description = decodeHtml(
+    card.match(/<div class="paragraph-block[^"]*">\s*<p>([\s\S]*?)<\/p>/i)?.[1] || '',
+  );
+  const levelCode = card.match(/data-category="(l|m|h|vh)"/i)?.[1]?.toLowerCase();
+  const levelLabel = { l: 'Low', m: 'Moderate', h: 'High', vh: 'Very High' }[levelCode];
+  const issued = decodeHtml(card.match(/<p class="last-issued[^"]*">([\s\S]*?)<\/p>/i)?.[1] || '');
+  if (!description || !levelLabel) {
+    throw new Error(`Could not parse the Met Office pollen card for region ${region.id}`);
+  }
+
+  const categories = {};
+  for (const match of description.matchAll(/\b(Very High|High|Moderate|Low)\s+(grass|tree|weed)\s+pollen\b/gi)) {
+    const category = match[2].toLowerCase();
+    categories[category] = makeSignal({
+      category,
+      index: metOfficeIndex(match[1]),
+      units: 'regional severity',
+      sourceDetail: `${region.name}: ${match[1]} ${category} pollen`,
+      confidence: 0.68,
+    });
+  }
+  categories.aggregate = makeSignal({
+    category: 'aggregate',
+    index: metOfficeIndex(levelLabel),
+    units: 'regional severity',
+    sourceDetail: `${region.name}: ${description}`,
+    confidence: 0.66,
+  });
+
+  return {
+    id: 'metoffice',
+    name: 'Met Office Pollen',
+    status: 'ok',
+    modelFamily: 'Met Office',
+    categories,
+    receivedAt: new Date().toISOString(),
+    notes: [
+      `Nearest published region: ${region.name}.`,
+      issued || 'Five-day regional forecast from the Met Office pollen model.',
+    ],
+  };
+}
+
 async function fetchTomorrow(lat, lng, env) {
   const key = env.TOMORROW_API_KEY;
   if (!key) return emptyProvider('tomorrow', 'Tomorrow.io', 'missing-key', ['TOMORROW_API_KEY is not set.']);
+  if (env.ENABLE_TOMORROW_POLLEN !== 'true') {
+    return emptyProvider('tomorrow', 'Tomorrow.io', 'disabled-premium', [
+      'Pollen is a Tomorrow.io premium layer. Set ENABLE_TOMORROW_POLLEN=true only after the account is entitled.',
+    ]);
+  }
 
   const params = new URLSearchParams({
     location: `${lat},${lng}`,
@@ -438,12 +767,15 @@ async function fetchTomorrow(lat, lng, env) {
 
   const familySignals = ['grass', 'tree', 'weed'].map((keyName) => categories[keyName]).filter(Boolean);
   if (familySignals.length > 0) {
-    const avg = familySignals.reduce((sum, signal) => sum + signal.index, 0) / familySignals.length;
+    const highest = familySignals.reduce(
+      (dominant, signal) => (signal.index > dominant.index ? signal : dominant),
+      familySignals[0],
+    );
     categories.aggregate = makeSignal({
       category: 'aggregate',
-      index: avg,
+      index: highest.index,
       units: 'index 0-5',
-      sourceDetail: 'Average of Tomorrow.io grass, tree, and weed indices',
+      sourceDetail: `Highest Tomorrow.io family severity (${highest.label})`,
       confidence: 0.72,
     });
   }
@@ -516,14 +848,18 @@ async function buildForecast(lat, lng, env) {
   const settled = await Promise.allSettled([
     fetchOpenMeteo(lat, lng),
     fetchGooglePollen(lat, lng, env),
-    fetchTomorrow(lat, lng, env),
+    fetchPollenInformation(lat, lng, env),
+    fetchMetOfficePollen(lat, lng),
   ]);
 
   const providers = settled.map((result, index) => {
     if (result.status === 'fulfilled') return result.value;
     if (index === 0) return statusProvider('openmeteo', 'Open-Meteo / CAMS', result.reason);
     if (index === 1) return statusProvider('google', 'Google Pollen API', result.reason);
-    return statusProvider('tomorrow', 'Tomorrow.io', result.reason);
+    if (index === 2) {
+      return statusProvider('polleninformation', 'Austrian Pollen Information Service', result.reason);
+    }
+    return statusProvider('metoffice', 'Met Office Pollen', result.reason);
   });
 
   const ensemble = synthesize(providers);
@@ -541,6 +877,9 @@ async function buildForecast(lat, lng, env) {
     providers,
     caveats: [
       'Open-Meteo uses the CAMS model family, so CAMS is not counted as a separate ensemble member.',
+      'Austrian Pollen Information Service data is used in its documented supported countries, cached for four hours by country and area, and licensed for non-commercial use.',
+      'Met Office pollen is an independent UK-only regional model and is weighted below the location-specific sources.',
+      'All pollen uses each source’s highest grass, tree, or weed severity, then confidence-weights the source scores.',
       'Provider indices are normalized onto a 0-100 score for blending; raw Open-Meteo concentrations are retained in signal details.',
     ],
   };
