@@ -31,6 +31,17 @@ The Met Office feed is cached by the API and parsed from its public regional for
 
 This repo deploys through `.github/workflows/pages.yml`.
 
+Every push to `main` deploys the Cloudflare Worker first, verifies that it is running the
+same commit SHA, then deploys GitHub Pages and verifies the published `deploy.json`.
+Configure these GitHub Actions secrets before merging to `main`:
+
+```text
+CLOUDFLARE_ACCOUNT_ID
+CLOUDFLARE_API_TOKEN
+```
+
+The Cloudflare token only needs permission to edit Workers Scripts for the account.
+
 GitHub Pages is static hosting and cannot run `server/index.js`. On Pages, the app will:
 
 - fetch Open-Meteo directly from the browser;

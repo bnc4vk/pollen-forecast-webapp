@@ -1454,6 +1454,7 @@ export default {
         return jsonResponse(request, env, {
           ok: true,
           service: 'pollen-forecast-worker',
+          deploySha: env.DEPLOY_SHA || 'unknown',
           time: new Date().toISOString(),
         });
       }
