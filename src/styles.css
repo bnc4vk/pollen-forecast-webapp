@@ -423,49 +423,25 @@ button {
 }
 
 .map-legend {
-  position: relative;
-  min-width: 0;
-  width: max-content;
-  min-width: 176px;
-  max-width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(116px, 170px) auto;
+  align-items: center;
+  gap: 8px;
+  width: min(236px, calc(100vw - 100px));
+  color: #22332b;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 850;
 }
 
-.map-legend::after {
-  content: attr(data-tooltip);
-  position: absolute;
-  left: 0;
-  bottom: calc(100% + 8px);
-  width: min(360px, calc(100vw - 36px));
-  padding: 9px 10px;
-  border: 1px solid rgba(32, 58, 45, 0.12);
-  border-radius: 8px;
-  background: rgba(23, 34, 28, 0.96);
-  color: #ffffff;
-  box-shadow: 0 16px 38px rgba(20, 29, 24, 0.2);
-  font-size: 0.76rem;
-  font-weight: 650;
-  line-height: 1.35;
-  opacity: 0;
+.map-dock > .map-legend {
   pointer-events: none;
-  transform: translateY(4px);
-  transition:
-    opacity 140ms ease,
-    transform 140ms ease;
-}
-
-.map-legend:hover::after,
-.map-legend:focus::after,
-.map-legend:focus-visible::after,
-.map-legend.tooltip-open::after {
-  opacity: 1;
-  transform: translateY(0);
 }
 
 .legend-ramp {
   display: block;
   width: 100%;
   height: 7px;
-  margin-top: 6px;
   border-radius: 999px;
   background: linear-gradient(90deg, rgba(255, 255, 255, 0) 0 13%, #489b6f 19%, #b2c64e, #edaf49, #da5c46, #74498f);
   box-shadow: inset 0 0 0 1px rgba(32, 58, 45, 0.08);
@@ -473,6 +449,12 @@ button {
 
 .legend-ramp.flat {
   background: #dfe6da;
+}
+
+.regional-boundary {
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
 }
 
 .timelapse-panel,
@@ -962,7 +944,6 @@ button {
 
   .legend-ramp {
     height: 4px;
-    margin-top: 4px;
   }
 
   .map-control-panel {

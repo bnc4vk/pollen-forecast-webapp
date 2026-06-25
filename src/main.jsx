@@ -487,7 +487,6 @@ function PollenMap({
   const regionalOverlayRef = useRef(null);
   const regionalFitRef = useRef(false);
   const weatherOverlayRef = useRef(null);
-  const [legendHelpOpen, setLegendHelpOpen] = useState(false);
   const activeFrame = useMemo(
     () => interpolatedFrameFor(gridData, timeProgress),
     [gridData, timeProgress],
@@ -510,20 +509,6 @@ function PollenMap({
   const hasEnsembleScore = Number(selectedCategoryData?.score) > 0;
   const hasVisibleLayer = Boolean(spatialData?.cells?.length || regionalData?.regions?.length);
   const regionalCategory = selectedCategory || 'aggregate';
-  const activeArea = activeCell || activeRegion;
-  const activeAreaScore = activeArea?.scores?.[regionalCategory];
-  const activeAreaLabel = activeCell
-    ? `${activeCell.regionName} · ${activeCell.scaleLabel}`
-    : activeRegion?.name;
-  const legendTooltip = spatialError || regionalError
-    ? spatialError || regionalError
-    : spatialLoading
-      ? 'Loading scale-adjusted pollen cells for this map view.'
-      : regionalLoading
-        ? 'Building a daily ensemble for the 16 Met Office pollen regions.'
-        : activeArea
-          ? `${activeAreaLabel}: ${activeAreaScore?.label || 'Pollen risk'} ${activeAreaScore?.score ?? 0}/100. Provider weights reflect the displayed spatial scale.`
-          : 'Pan over the UK to inspect the daily pollen ensemble.';
 
   const centerOnUser = () => {
     const map = mapRef.current;
@@ -549,8 +534,6 @@ function PollenMap({
       maxZoom: 19,
       attribution: '&copy; OpenStreetMap contributors',
     }).addTo(map);
-    L.control.zoom({ position: 'bottomright' }).addTo(map);
-
     const PollenLayer = L.Layer.extend({
       onAdd(activeMap) {
         this._map = activeMap;
@@ -718,17 +701,18 @@ function PollenMap({
         }
       : regionalData.geojson;
     const layer = L.geoJSON(geojson, {
-      renderer: L.canvas({ padding: 0.5 }),
-      smoothFactor: usingSpatialCells ? 0 : 2,
+      renderer: usingSpatialCells ? L.canvas({ padding: 0.5 }) : L.svg({ padding: 0.5 }),
+      smoothFactor: usingSpatialCells ? 0 : 0.35,
       style: (feature) => {
         const area = areasById.get(feature.properties?.id);
         const score = Number(area?.scores?.[regionalCategory]?.score || 0);
         return {
-          color: usingSpatialCells ? 'rgba(255, 255, 255, 0.62)' : 'rgba(255, 255, 255, 0.9)',
-          weight: usingSpatialCells ? 0.8 : 1.4,
-          opacity: 0.9,
+          className: usingSpatialCells ? 'spatial-cell-boundary' : 'regional-boundary',
+          color: usingSpatialCells ? 'rgba(255, 255, 255, 0.62)' : 'rgba(255, 255, 255, 0.5)',
+          weight: usingSpatialCells ? 0.8 : 0.75,
+          opacity: usingSpatialCells ? 0.9 : 0.75,
           fillColor: scoreColor(score, 1),
-          fillOpacity: usingSpatialCells ? 0.64 : 0.58,
+          fillOpacity: usingSpatialCells ? 0.64 : 0.62,
         };
       },
       onEachFeature: (feature, featureLayer) => {
@@ -744,11 +728,11 @@ function PollenMap({
           sticky: true,
         });
         featureLayer.on({
-          mouseover: () => featureLayer.setStyle({ weight: 2.2, fillOpacity: 0.72 }),
+          mouseover: () => featureLayer.setStyle({ weight: 1.5, fillOpacity: 0.7 }),
           mouseout: () =>
             featureLayer.setStyle({
-              weight: usingSpatialCells ? 0.8 : 1.4,
-              fillOpacity: usingSpatialCells ? 0.64 : 0.58,
+              weight: usingSpatialCells ? 0.8 : 0.75,
+              fillOpacity: usingSpatialCells ? 0.64 : 0.62,
             }),
         });
       },
@@ -893,31 +877,12 @@ function PollenMap({
       <div ref={mapNode} className="leaflet-host" />
       <div className="map-dock">
         <div
-          className={`map-legend ${legendHelpOpen ? 'tooltip-open' : ''}`}
-          aria-label={legendTooltip}
-          data-tooltip={legendTooltip}
-          title={legendTooltip}
-          tabIndex={0}
-          onMouseEnter={() => setLegendHelpOpen(true)}
-          onMouseLeave={() => setLegendHelpOpen(false)}
-          onFocus={() => setLegendHelpOpen(true)}
-          onBlur={() => setLegendHelpOpen(false)}
-          onClick={() => setLegendHelpOpen((value) => !value)}
+          className="map-legend"
+          aria-label="Pollen score color scale from 0 to 100"
         >
-          <div>
-            <p className="toolbar-value">
-              {spatialError || regionalError
-                ? 'Spatial forecast unavailable'
-                : spatialLoading
-                  ? 'Loading local pollen cells'
-                  : regionalLoading
-                    ? 'Loading 16 UK regions'
-                    : activeArea
-                      ? `${activeAreaLabel} · ${activeAreaScore?.label || 'Pollen'} ${activeAreaScore?.score ?? 0}/100`
-                      : 'UK regional pollen risk'}
-            </p>
-          </div>
+          <span aria-hidden="true">0</span>
           <span className={`legend-ramp ${!hasVisibleLayer ? 'flat' : ''}`} aria-hidden="true" />
+          <span aria-hidden="true">100</span>
         </div>
       </div>
     </section>

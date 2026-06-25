@@ -249,31 +249,6 @@ function parseMetOfficeGeoJson(script) {
   geojson.features = geojson.features.filter((feature) =>
     ['Polygon', 'MultiPolygon'].includes(feature.geometry?.type),
   );
-  const simplifyRing = (ring, tolerance = 0.04) => {
-    if (ring.length < 5) return ring;
-    const simplified = [ring[0]];
-    let previous = ring[0];
-    for (let index = 1; index < ring.length - 1; index += 1) {
-      const point = ring[index];
-      const lngScale = Math.cos((point[1] * Math.PI) / 180);
-      const distance = Math.hypot((point[0] - previous[0]) * lngScale, point[1] - previous[1]);
-      if (distance >= tolerance) {
-        simplified.push(point);
-        previous = point;
-      }
-    }
-    simplified.push(ring[ring.length - 1]);
-    return simplified.length >= 4 ? simplified : ring;
-  };
-  for (const feature of geojson.features) {
-    if (feature.geometry.type === 'Polygon') {
-      feature.geometry.coordinates = feature.geometry.coordinates.map((ring) => simplifyRing(ring));
-    } else {
-      feature.geometry.coordinates = feature.geometry.coordinates.map((polygon) =>
-        polygon.map((ring) => simplifyRing(ring)),
-      );
-    }
-  }
   return geojson;
 }
 
