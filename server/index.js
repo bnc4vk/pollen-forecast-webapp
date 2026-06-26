@@ -29,7 +29,7 @@ const OPEN_METEO_POLLEN = [
 ];
 
 const CATEGORY_DEFS = {
-  aggregate: { label: 'Worst', type: 'aggregate' },
+  aggregate: { label: 'Worst allergen', type: 'aggregate' },
   grass: { label: 'Grass', type: 'family' },
   tree: { label: 'Tree', type: 'family' },
   weed: { label: 'Weed', type: 'family' },
@@ -111,8 +111,13 @@ const MET_OFFICE_REGIONS = [
   { id: 'sw', name: 'South West England', lat: 50.899, lng: -3.444 },
 ];
 const MAX_TIMELAPSE_HOURS = 8;
+const FORECAST_CELL_KM = 11;
+const MAX_FORECAST_CELLS = 160000;
+const MAX_OPEN_METEO_FORECAST_POINTS = 280;
+const OPEN_METEO_COORDINATE_BATCH_SIZE = 300;
 const WEATHER_GRID_ROWS = 4;
 const WEATHER_GRID_COLS = 4;
+const openMeteoGridCache = new Map();
 const SPATIAL_11KM_ZOOM = 9.5;
 const SPATIAL_1KM_ZOOM = 13;
 const MAX_SPATIAL_CELLS = 144;
@@ -374,6 +379,70 @@ function buildGridPoints(bounds, rows, cols) {
   return points;
 }
 
+function buildForecastCells(bounds, cellKm = FORECAST_CELL_KM) {
+  const latStep = cellKm / 111.32;
+  const southIndex = Math.floor((bounds.south + 90) / latStep);
+  const northIndex = Math.floor((bounds.north + 90) / latStep);
+  const cells = [];
+
+  for (let latIndex = southIndex; latIndex <= northIndex; latIndex += 1) {
+    const south = latIndex * latStep - 90;
+    const north = south + latStep;
+    const lat = (south + north) / 2;
+    const lngStep = cellKm / (111.32 * Math.max(Math.cos((lat * Math.PI) / 180), 0.2));
+    const westIndex = Math.floor((bounds.west + 180) / lngStep);
+    const eastIndex = Math.floor((bounds.east + 180) / lngStep);
+
+    for (let lngIndex = westIndex; lngIndex <= eastIndex; lngIndex += 1) {
+      const west = lngIndex * lngStep - 180;
+      const east = west + lngStep;
+      const lng = (west + east) / 2;
+      cells.push({
+        id: `${cellKm}:${latIndex}:${lngIndex}`,
+        lat: Number(lat.toFixed(5)),
+        lng: Number(lng.toFixed(5)),
+        bounds: {
+          north: Number(north.toFixed(5)),
+          south: Number(south.toFixed(5)),
+          east: Number(east.toFixed(5)),
+          west: Number(west.toFixed(5)),
+        },
+      });
+    }
+  }
+
+  if (cells.length > MAX_FORECAST_CELLS) {
+    throw new Error(`This forecast view contains ${cells.length} cells; narrow the map area to load 11 km forecast tiles.`);
+  }
+
+  return cells;
+}
+
+function buildForecastSamplePoints(bounds, maxPoints = MAX_OPEN_METEO_FORECAST_POINTS) {
+  const latSpan = Math.max(bounds.north - bounds.south, 0.0001);
+  const lngSpan = Math.max(bounds.east - bounds.west, 0.0001);
+  const aspect = lngSpan / latSpan;
+  const cols = Math.max(2, Math.round(Math.sqrt(maxPoints * aspect)));
+  const rows = Math.max(2, Math.floor(maxPoints / cols));
+  const latStep = latSpan / Math.max(rows - 1, 1);
+  const lngStep = lngSpan / Math.max(cols - 1, 1);
+  const points = [];
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const lat = bounds.south + latStep * row;
+      const lng = bounds.west + lngStep * col;
+      points.push({
+        id: `sample:${row}:${col}`,
+        lat: Number(lat.toFixed(5)),
+        lng: Number(lng.toFixed(5)),
+      });
+    }
+  }
+
+  return { points, rows, cols };
+}
+
 function classifyRain({ precipitation = 0, weatherCode = 0, windGusts = 0 }) {
   const stormCode = [95, 96, 99].includes(Number(weatherCode));
   if (stormCode || (precipitation >= 2.5 && windGusts >= 28) || precipitation >= 6) {
@@ -476,36 +545,78 @@ function nearestHourlyIndex(hourly) {
   return nearestIndex;
 }
 
-async function fetchOpenMeteoGrid(bounds, category, horizonHours = MAX_TIMELAPSE_HOURS) {
-  const rows = 8;
-  const cols = 8;
+async function fetchOpenMeteoGrid(bounds, category, horizonHours = MAX_TIMELAPSE_HOURS, { coverage = 'bounds' } = {}) {
   const safeHorizon = clamp(Number(horizonHours) || MAX_TIMELAPSE_HOURS, 1, MAX_TIMELAPSE_HOURS);
-  const points = buildGridPoints(bounds, rows, cols);
-
-  const params = new URLSearchParams({
-    latitude: points.map((point) => point.lat.toFixed(5)).join(','),
-    longitude: points.map((point) => point.lng.toFixed(5)).join(','),
-    hourly: OPEN_METEO_POLLEN.join(','),
-    forecast_days: '2',
-    timezone: 'auto',
+  const cacheKey = JSON.stringify({
+    coverage,
+    bounds: Object.fromEntries(Object.entries(bounds).map(([key, value]) => [key, Number(value).toFixed(3)])),
+    category,
+    safeHorizon,
   });
-  const data = await fetchJson(`https://air-quality-api.open-meteo.com/v1/air-quality?${params}`);
-  const payloads = Array.isArray(data) ? data : [data];
+  const cached = openMeteoGridCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < 10 * 60 * 1000) return cached.value;
+
+  const regionalGeojson = coverage === 'regional' ? await fetchMetOfficePolygons() : null;
+  const cells = regionalGeojson
+    ? buildForecastCells(bounds).filter((cell) => regionForPoint(regionalGeojson, cell.lat, cell.lng))
+    : buildForecastCells(bounds);
+  const regionalSampled = Boolean(regionalGeojson && cells.length > MAX_OPEN_METEO_FORECAST_POINTS);
+  const sampled = !regionalGeojson && cells.length > MAX_OPEN_METEO_FORECAST_POINTS;
+  const sampleGrid = sampled || regionalSampled ? buildForecastSamplePoints(bounds) : { points: cells, rows: null, cols: null };
+  const requestPoints = sampleGrid.points;
+  const batchRequests = [];
+
+  for (let index = 0; index < requestPoints.length; index += OPEN_METEO_COORDINATE_BATCH_SIZE) {
+    const batch = requestPoints.slice(index, index + OPEN_METEO_COORDINATE_BATCH_SIZE);
+    const params = new URLSearchParams({
+      latitude: batch.map((cell) => cell.lat.toFixed(5)).join(','),
+      longitude: batch.map((cell) => cell.lng.toFixed(5)).join(','),
+      hourly: OPEN_METEO_POLLEN.join(','),
+      forecast_days: '2',
+      timezone: 'auto',
+    });
+    batchRequests.push(fetchJson(`https://air-quality-api.open-meteo.com/v1/air-quality?${params}`));
+  }
+
+  const payloads = (await Promise.all(batchRequests)).flatMap((data) => (Array.isArray(data) ? data : [data]));
   const startIndices = payloads.map((payload) => nearestHourlyIndex(payload.hourly || {}));
+  const sampleIndexForCell = (cell) => {
+    if (!sampleGrid.rows || !sampleGrid.cols) return 0;
+    const latSpan = Math.max(bounds.north - bounds.south, 0.0001);
+    const lngSpan = Math.max(bounds.east - bounds.west, 0.0001);
+    const row = clamp(Math.round(((cell.lat - bounds.south) / latSpan) * (sampleGrid.rows - 1)), 0, sampleGrid.rows - 1);
+    const col = clamp(Math.round(((cell.lng - bounds.west) / lngSpan) * (sampleGrid.cols - 1)), 0, sampleGrid.cols - 1);
+    return row * sampleGrid.cols + col;
+  };
 
   const frames = Array.from({ length: safeHorizon + 1 }, (_, offsetHours) => {
-    const gridPoints = payloads.map((payload, index) => {
-      const sourcePoint = points[index] || { lat: payload.latitude, lng: payload.longitude };
+    const requestGridPoints = payloads.map((payload, index) => {
+      const sourceCell = requestPoints[index] || { lat: payload.latitude, lng: payload.longitude };
       const hourly = payload.hourly || {};
       const values = openMeteoHourlyValues(hourly, Math.min((startIndices[index] || 0) + offsetHours, (hourly.time?.length || 1) - 1));
       const value = openMeteoCategoryValue(values, category);
       return {
-        lat: Number(sourcePoint.lat.toFixed(5)),
-        lng: Number(sourcePoint.lng.toFixed(5)),
+        id: sourceCell.id || `forecast:${index}`,
+        lat: Number(sourceCell.lat.toFixed(5)),
+        lng: Number(sourceCell.lng.toFixed(5)),
+        bounds: sampled ? undefined : sourceCell.bounds,
         value: Number(value.toFixed(2)),
         score: Number(indexToScore(rawConcentrationToIndex(value)).toFixed(1)),
       };
     });
+    const gridPoints = regionalSampled
+      ? cells.map((cell) => {
+          const samplePoint = requestGridPoints[sampleIndexForCell(cell)] || requestGridPoints[0];
+          return {
+            id: cell.id,
+            lat: cell.lat,
+            lng: cell.lng,
+            bounds: cell.bounds,
+            value: Number((samplePoint?.value || 0).toFixed(2)),
+            score: Number((samplePoint?.score || 0).toFixed(1)),
+          };
+        })
+      : requestGridPoints;
     const values = gridPoints.map((point) => point.value);
     const firstHourly = payloads[0]?.hourly || {};
     const firstTimeIndex = Math.min((startIndices[0] || 0) + offsetHours, (firstHourly.time?.length || 1) - 1);
@@ -522,15 +633,20 @@ async function fetchOpenMeteoGrid(bounds, category, horizonHours = MAX_TIMELAPSE
   const firstFrame = frames[0] || { min: 0, max: 0, points: [] };
   const frameMins = frames.map((frame) => frame.min);
   const frameMaxes = frames.map((frame) => frame.max);
-  return {
+  const result = {
     category,
     label: categoryName(category),
     units: 'grains/m3',
     source: 'Open-Meteo / CAMS hourly coordinate-list grid',
+    scaleKm: FORECAST_CELL_KM,
+    scaleLabel: '11 km forecast tile',
+    sampled,
+    regionalSampled,
+    sampleRows: sampleGrid.rows,
+    sampleCols: sampleGrid.cols,
+    displayCellCount: cells.length,
     generatedAt: new Date().toISOString(),
     bounds,
-    rows,
-    cols,
     horizonHours: safeHorizon,
     offsetHours: firstFrame.offsetHours,
     time: firstFrame.time,
@@ -539,6 +655,8 @@ async function fetchOpenMeteoGrid(bounds, category, horizonHours = MAX_TIMELAPSE
     points: firstFrame.points,
     frames,
   };
+  openMeteoGridCache.set(cacheKey, { cachedAt: Date.now(), value: result });
+  return result;
 }
 
 async function fetchOpenMeteoWeather(lat, lng, bounds) {
@@ -1315,7 +1433,7 @@ async function buildForecast(lat, lng) {
       'Open-Meteo uses the CAMS model family, so CAMS is not counted as a separate ensemble member.',
       'Austrian Pollen Information Service data is used in its documented supported countries, cached for four hours by country and area, and licensed for non-commercial use.',
       'Met Office pollen is an independent UK-only regional model and is weighted below the location-specific sources.',
-      'Worst is the highest confidence-weighted ensemble score among grass, tree, and weed.',
+      'Worst allergen is the highest confidence-weighted ensemble score among grass, tree, and weed.',
       'Provider indices are normalized onto a 0-100 score for blending; raw Open-Meteo concentrations are retained in signal details.',
     ],
   };
@@ -1458,6 +1576,7 @@ app.get('/api/grid', async (req, res) => {
   };
   const category = CATEGORY_DEFS[req.query.category] ? req.query.category : 'aggregate';
   const horizonHours = clamp(parseCoord(req.query.horizonHours, MAX_TIMELAPSE_HOURS), 1, MAX_TIMELAPSE_HOURS);
+  const coverage = req.query.coverage === 'regional' ? 'regional' : 'bounds';
   if (bounds.south > bounds.north || bounds.west > bounds.east) {
     res.status(400).json({ error: 'Invalid map bounds' });
     return;
@@ -1465,6 +1584,7 @@ app.get('/api/grid', async (req, res) => {
 
   const cacheKey = [
     'grid',
+    coverage,
     category,
     roundCoord(bounds.north),
     roundCoord(bounds.south),
@@ -1480,7 +1600,7 @@ app.get('/api/grid', async (req, res) => {
   }
 
   try {
-    const value = await fetchOpenMeteoGrid(bounds, category, horizonHours);
+    const value = await fetchOpenMeteoGrid(bounds, category, horizonHours, { coverage });
     cache.set(cacheKey, { created: Date.now(), value });
     res.json(value);
   } catch (error) {

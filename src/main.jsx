@@ -38,6 +38,33 @@ const DEFAULT_WEATHER = {
   guidance: 'Live rain and wind will appear when weather data loads.',
   points: [],
 };
+const FORECAST_PROVIDER_STATUSES = [
+  {
+    id: 'openmeteo',
+    name: 'Open-Meteo / CAMS',
+    status: 'ok',
+    weightMultiplier: 1,
+    notes: ['Hourly forecast playback source.'],
+  },
+  {
+    id: 'google',
+    name: 'Google Pollen API',
+    status: 'no-forecast',
+    notes: ['No hourly forecasting support in playback mode.'],
+  },
+  {
+    id: 'polleninformation',
+    name: 'Austrian Pollen Information Service',
+    status: 'no-forecast',
+    notes: ['No hourly forecasting support in playback mode.'],
+  },
+  {
+    id: 'metoffice',
+    name: 'Met Office Pollen',
+    status: 'no-forecast',
+    notes: ['No hourly forecasting support in playback mode.'],
+  },
+];
 const FALLBACK_LOCATIONS = [
   { id: 'fallback-london', label: 'London, England', lat: 51.5074, lng: -0.1278, aliases: ['london'] },
   { id: 'fallback-paris', label: 'Paris, France', lat: 48.8566, lng: 2.3522, aliases: ['paris'] },
@@ -72,7 +99,7 @@ const FALLBACK_LOCATIONS = [
   { id: 'fallback-heathrow', label: 'Heathrow Airport, Greater London, England', lat: 51.47, lng: -0.4543, aliases: ['heathrow', 'heathrow airport'] },
 ];
 const CATEGORY_LABELS = {
-  aggregate: 'Worst',
+  aggregate: 'Worst allergen',
   grass: 'Grass',
   tree: 'Tree',
   weed: 'Weed',
@@ -177,12 +204,17 @@ function categoryLabel(key) {
   return CATEGORY_LABELS[key] || key;
 }
 
+function formatScore(score) {
+  const value = Number(score);
+  return Number.isFinite(value) ? String(Math.round(value)) : '0';
+}
+
 function weatherProminence(weather, score) {
   const liveWeather = weather || DEFAULT_WEATHER;
   const rain = liveWeather.rain || DEFAULT_WEATHER.rain;
   const wind = liveWeather.wind || DEFAULT_WEATHER.wind;
   const multiplier = clamp(Number(liveWeather.multiplier ?? rain.multiplier * wind.multiplier) || 1, 0.55, 1.65);
-  const adjustedScore = Number(clamp((Number(score) || 0) * multiplier, 0, 100).toFixed(1));
+  const adjustedScore = Math.round(clamp((Number(score) || 0) * multiplier, 0, 100));
   const direction = multiplier < 0.9 ? 'lower' : multiplier > 1.12 ? 'higher' : 'similar';
 
   return {
@@ -200,7 +232,7 @@ function frameScore(frame) {
   const visiblePoints = frame.points.filter((point) => Number.isFinite(point.score));
   if (!visiblePoints.length) return null;
   const average = visiblePoints.reduce((sum, point) => sum + point.score, 0) / visiblePoints.length;
-  return Number(average.toFixed(1));
+  return Math.round(average);
 }
 
 function interpolatedFrameFor(gridData, progress) {
@@ -215,10 +247,12 @@ function interpolatedFrameFor(gridData, progress) {
   const points = lower.points.map((point, index) => {
     const nextPoint = upper.points[index] || point;
     return {
+      id: point.id,
       lat: point.lat,
       lng: point.lng,
+      bounds: point.bounds,
       value: point.value + (nextPoint.value - point.value) * mix,
-      score: point.score + (nextPoint.score - point.score) * mix,
+      score: Math.round(point.score + (nextPoint.score - point.score) * mix),
     };
   });
   const values = points.map((point) => point.value);
@@ -253,12 +287,14 @@ function formatFrameTime(time, intervalMinutes = 1) {
 
 function displayStatus(status) {
   if (status === 'ok') return 'ok';
+  if (status === 'no-forecast') return 'no forecasting support';
   if (status === 'not-covered') return 'location not covered';
   return 'no data';
 }
 
 function providerDisplayStatus(provider) {
   if (provider.status === 'ok') return 'ok';
+  if (provider.status === 'no-forecast') return 'no-forecast';
   if (provider.status === 'location-not-covered' || provider.status === 'not-covered') {
     return 'not-covered';
   }
@@ -467,6 +503,8 @@ function PollenMap({
   onZoomChange,
   selectedCategory,
   selectedCategoryData,
+  forecastMode,
+  forecastCategory,
   gridData,
   gridLoading,
   timeProgress,
@@ -484,6 +522,7 @@ function PollenMap({
   const mapRef = useRef(null);
   const accuracyRef = useRef(null);
   const overlayRef = useRef(null);
+  const forecastCellOverlayRef = useRef(null);
   const regionalOverlayRef = useRef(null);
   const regionalFitRef = useRef(false);
   const weatherOverlayRef = useRef(null);
@@ -504,11 +543,13 @@ function PollenMap({
       frameMin: activeFrame.min,
     };
   }, [gridData, activeFrame]);
-  const gridIsCurrent = gridData?.category === selectedCategory;
+  const gridIsCurrent = gridData?.category === forecastCategory;
+  const forecastGridData = gridIsCurrent ? activeGridData : null;
   const gridIsFlatZero = gridIsCurrent && activeGridData && activeGridData.min === 0 && activeGridData.frameMax === 0;
   const hasEnsembleScore = Number(selectedCategoryData?.score) > 0;
-  const hasVisibleLayer = Boolean(spatialData?.cells?.length || regionalData?.regions?.length);
-  const regionalCategory = selectedCategory || 'aggregate';
+  const hasForecastCells = Boolean(forecastMode && forecastGridData?.points?.length);
+  const hasVisibleLayer = Boolean(hasForecastCells || spatialData?.cells?.length || regionalData?.regions?.length);
+  const regionalCategory = forecastMode ? forecastCategory : selectedCategory || 'aggregate';
 
   const centerOnUser = () => {
     const map = mapRef.current;
@@ -523,12 +564,14 @@ function PollenMap({
     if (!mapNode.current || mapRef.current) return;
 
     const map = L.map(mapNode.current, {
-      zoomControl: false,
+      zoomControl: true,
       zoomSnap: 0.25,
       preferCanvas: true,
       attributionControl: true,
     }).setView([location.lat, location.lng], REGIONAL_ZOOM);
 
+    map.zoomControl.setPosition('topright');
+    map.attributionControl.setPosition('bottomleft');
     map.attributionControl.setPrefix(false);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
@@ -598,7 +641,203 @@ function PollenMap({
       },
     });
 
+    const ForecastCellLayer = L.Layer.extend({
+      onAdd(activeMap) {
+        this._map = activeMap;
+        this._canvas = L.DomUtil.create('canvas', 'forecast-canvas');
+        this._canvas.setAttribute('aria-hidden', 'true');
+        activeMap.getPanes().overlayPane.appendChild(this._canvas);
+        activeMap.on('move zoom resize viewreset', this._draw, this);
+        activeMap.on('mousemove', this._handleMouseMove, this);
+        activeMap.on('mouseout', this._hideTooltip, this);
+        this._draw();
+      },
+      onRemove(activeMap) {
+        activeMap.off('move zoom resize viewreset', this._draw, this);
+        activeMap.off('mousemove', this._handleMouseMove, this);
+        activeMap.off('mouseout', this._hideTooltip, this);
+        this._hideTooltip();
+        this._canvas?.remove();
+      },
+      setData(data) {
+        this._data = data;
+        if (!data) this._hideTooltip();
+        this._draw();
+      },
+      _drawCell(ctx, bounds, score) {
+        if (!Number.isFinite(score)) return;
+        const nw = this._map.latLngToContainerPoint([bounds.north, bounds.west]);
+        const se = this._map.latLngToContainerPoint([bounds.south, bounds.east]);
+        const x = Math.min(nw.x, se.x);
+        const y = Math.min(nw.y, se.y);
+        const width = Math.max(Math.abs(se.x - nw.x), 0.65);
+        const height = Math.max(Math.abs(se.y - nw.y), 0.65);
+        ctx.fillStyle = score <= LOW_COLOR_THRESHOLD ? 'rgba(72, 155, 111, 0.16)' : scoreColor(score, 0.64);
+        ctx.fillRect(x, y, width, height);
+        if (width >= 3 && height >= 3) {
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.42)';
+          ctx.lineWidth = 0.65;
+          ctx.strokeRect(x, y, width, height);
+        }
+      },
+      _drawSampled(ctx, data) {
+        const bounds = data.bounds;
+        const rows = data.sampleRows || 1;
+        const cols = data.sampleCols || 1;
+        const latStep = (bounds.north - bounds.south) / Math.max(rows - 1, 1);
+        const lngStep = (bounds.east - bounds.west) / Math.max(cols - 1, 1);
+
+        data.points.forEach((point, index) => {
+          const row = Math.floor(index / cols);
+          const col = index % cols;
+          const sampleBounds = {
+            south: row === 0 ? bounds.south : point.lat - latStep / 2,
+            north: row === rows - 1 ? bounds.north : point.lat + latStep / 2,
+            west: col === 0 ? bounds.west : point.lng - lngStep / 2,
+            east: col === cols - 1 ? bounds.east : point.lng + lngStep / 2,
+          };
+          this._drawCell(ctx, sampleBounds, point.score);
+        });
+
+        const cellKm = data.scaleKm || 11;
+        const forecastLatStep = cellKm / 111.32;
+        const southIndex = Math.floor((bounds.south + 90) / forecastLatStep);
+        const northIndex = Math.floor((bounds.north + 90) / forecastLatStep);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.34)';
+        ctx.lineWidth = 0.55;
+        for (let latIndex = southIndex; latIndex <= northIndex; latIndex += 1) {
+          const lat = latIndex * forecastLatStep - 90;
+          const west = this._map.latLngToContainerPoint([lat, bounds.west]);
+          const east = this._map.latLngToContainerPoint([lat, bounds.east]);
+          ctx.beginPath();
+          ctx.moveTo(west.x, west.y);
+          ctx.lineTo(east.x, east.y);
+          ctx.stroke();
+        }
+
+        const centerLat = (bounds.north + bounds.south) / 2;
+        const forecastLngStep = cellKm / (111.32 * Math.max(Math.cos((centerLat * Math.PI) / 180), 0.2));
+        const westIndex = Math.floor((bounds.west + 180) / forecastLngStep);
+        const eastIndex = Math.floor((bounds.east + 180) / forecastLngStep);
+        for (let lngIndex = westIndex; lngIndex <= eastIndex; lngIndex += 1) {
+          const lng = lngIndex * forecastLngStep - 180;
+          const north = this._map.latLngToContainerPoint([bounds.north, lng]);
+          const south = this._map.latLngToContainerPoint([bounds.south, lng]);
+          ctx.beginPath();
+          ctx.moveTo(north.x, north.y);
+          ctx.lineTo(south.x, south.y);
+          ctx.stroke();
+        }
+      },
+      _forecastCellBounds(latlng, cellKm) {
+        const latStep = cellKm / 111.32;
+        const latIndex = Math.floor((latlng.lat + 90) / latStep);
+        const south = latIndex * latStep - 90;
+        const north = south + latStep;
+        const lat = (south + north) / 2;
+        const lngStep = cellKm / (111.32 * Math.max(Math.cos((lat * Math.PI) / 180), 0.2));
+        const lngIndex = Math.floor((latlng.lng + 180) / lngStep);
+        const west = lngIndex * lngStep - 180;
+        const east = west + lngStep;
+        return { north, south, east, west, lat, lng: (west + east) / 2 };
+      },
+      _pointForLatLng(latlng, data) {
+        if (!data?.points?.length) return null;
+        if (!data.sampled) {
+          return data.points.find(
+            (point) =>
+              point.bounds &&
+              latlng.lat >= point.bounds.south &&
+              latlng.lat <= point.bounds.north &&
+              latlng.lng >= point.bounds.west &&
+              latlng.lng <= point.bounds.east,
+          );
+        }
+
+        const rows = data.sampleRows || 1;
+        const cols = data.sampleCols || 1;
+        const latSpan = Math.max(data.bounds.north - data.bounds.south, 0.0001);
+        const lngSpan = Math.max(data.bounds.east - data.bounds.west, 0.0001);
+        const row = clamp(Math.round(((latlng.lat - data.bounds.south) / latSpan) * (rows - 1)), 0, rows - 1);
+        const col = clamp(Math.round(((latlng.lng - data.bounds.west) / lngSpan) * (cols - 1)), 0, cols - 1);
+        return data.points[row * cols + col] || null;
+      },
+      _handleMouseMove(event) {
+        const data = this._data;
+        if (!this._map || !data?.points?.length) {
+          this._hideTooltip();
+          return;
+        }
+        const bounds = data.bounds;
+        if (
+          bounds &&
+          (event.latlng.lat < bounds.south ||
+            event.latlng.lat > bounds.north ||
+            event.latlng.lng < bounds.west ||
+            event.latlng.lng > bounds.east)
+        ) {
+          this._hideTooltip();
+          return;
+        }
+        const point = this._pointForLatLng(event.latlng, data);
+        if (!point || !Number.isFinite(point.score)) {
+          this._hideTooltip();
+          return;
+        }
+        const cellBounds = point.bounds || this._forecastCellBounds(event.latlng, data.scaleKm || 11);
+        const center = [(cellBounds.north + cellBounds.south) / 2, (cellBounds.east + cellBounds.west) / 2];
+        const content = `${categoryLabel(data.category)} forecast ${formatScore(point.score)}/100`;
+        if (!this._tooltip) {
+          this._tooltip = L.tooltip({
+            className: 'regional-tooltip forecast-tooltip',
+            direction: 'top',
+            opacity: 0.96,
+          });
+        }
+        this._tooltip.setLatLng(center).setContent(content);
+        this._map.openTooltip(this._tooltip);
+      },
+      _hideTooltip() {
+        if (this._map && this._tooltip) {
+          this._map.closeTooltip(this._tooltip);
+        }
+      },
+      _draw() {
+        if (!this._map || !this._canvas) return;
+        const mapSize = this._map.getSize();
+        const topLeft = this._map.containerPointToLayerPoint([0, 0]);
+        const canvas = this._canvas;
+        const dpr = window.devicePixelRatio || 1;
+        const pixelWidth = Math.round(mapSize.x * dpr);
+        const pixelHeight = Math.round(mapSize.y * dpr);
+
+        L.DomUtil.setPosition(canvas, topLeft);
+        if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+          canvas.width = pixelWidth;
+          canvas.height = pixelHeight;
+          canvas.style.width = `${mapSize.x}px`;
+          canvas.style.height = `${mapSize.y}px`;
+        }
+
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, mapSize.x, mapSize.y);
+        const data = this._data;
+        if (!data?.points?.length) return;
+
+        if (!data.sampled) {
+          data.points.forEach((point) => {
+            if (point.bounds) this._drawCell(ctx, point.bounds, point.score);
+          });
+          return;
+        }
+
+        this._drawSampled(ctx, data);
+      },
+    });
+
     overlayRef.current = new PollenLayer().addTo(map);
+    forecastCellOverlayRef.current = new ForecastCellLayer().addTo(map);
 
     const emitMapState = () => {
       const next = map.getCenter();
@@ -667,24 +906,29 @@ function PollenMap({
   }, [searchLocation]);
 
   useEffect(() => {
-    overlayRef.current?.setData(gridIsCurrent ? activeGridData : null);
-  }, [activeGridData, gridIsCurrent]);
+    overlayRef.current?.setData(!forecastMode && gridIsCurrent ? activeGridData : null);
+    forecastCellOverlayRef.current?.setData(forecastMode && gridIsCurrent ? activeGridData : null);
+  }, [activeGridData, forecastMode, gridIsCurrent]);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
     regionalOverlayRef.current?.remove();
     regionalOverlayRef.current = null;
+    if (forecastMode) return;
     const usingSpatialCells = Boolean(spatialData?.cells?.length);
     if (!usingSpatialCells && !regionalData?.geojson?.features?.length) return;
 
     const areasById = new Map(
-      (usingSpatialCells ? spatialData.cells : regionalData.regions).map((area) => [area.id, area]),
+      (usingSpatialCells
+          ? spatialData.cells
+          : regionalData.regions
+      ).map((area) => [area.id, area]),
     );
     const geojson = usingSpatialCells
       ? {
           type: 'FeatureCollection',
-          features: spatialData.cells.map((cell) => ({
+          features: [...areasById.values()].map((cell) => ({
             type: 'Feature',
             properties: { id: cell.id },
             geometry: {
@@ -701,7 +945,9 @@ function PollenMap({
         }
       : regionalData.geojson;
     const layer = L.geoJSON(geojson, {
-      renderer: usingSpatialCells ? L.canvas({ padding: 0.5 }) : L.svg({ padding: 0.5 }),
+      renderer: usingSpatialCells
+          ? L.canvas({ padding: 0.5 })
+          : L.svg({ padding: 0.5 }),
       smoothFactor: usingSpatialCells ? 0 : 0.35,
       style: (feature) => {
         const area = areasById.get(feature.properties?.id);
@@ -720,10 +966,10 @@ function PollenMap({
         if (!area) return;
         const categoryScore = area.scores?.[regionalCategory];
         const score = categoryScore?.score ?? 0;
-        const label = usingSpatialCells
-          ? `${area.regionName} · ${area.scaleLabel}`
-          : area.name;
-        featureLayer.bindTooltip(`${label} · ${categoryScore?.label || 'Pollen'} ${score}/100`, {
+        const tooltip = usingSpatialCells
+            ? `${categoryScore?.label || 'Pollen'} ${formatScore(score)}/100`
+            : `${area.name} · ${categoryScore?.label || 'Pollen'} ${formatScore(score)}/100`;
+        featureLayer.bindTooltip(tooltip, {
           className: 'regional-tooltip',
           sticky: true,
         });
@@ -743,7 +989,7 @@ function PollenMap({
       map.setView([54.65, -3.2], REGIONAL_ZOOM, { animate: false });
       regionalFitRef.current = true;
     }
-  }, [regionalData, regionalCategory, spatialData, location.source]);
+  }, [forecastMode, regionalData, regionalCategory, spatialData, location.source]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -864,9 +1110,19 @@ function PollenMap({
       </div>
       {location.source !== 'precise' && !selectedPlaceLabel && (
         <div className="permission-panel" role="status" aria-live="polite">
-          <p>{spatialData ? `Showing ${spatialData.scaleLabel.toLowerCase()} detail.` : regionalData ? 'Showing the UK regional overview.' : location.label}</p>
+          <p>
+            {forecastMode && forecastGridData
+              ? `Showing ${forecastGridData.scaleLabel.toLowerCase()}s.`
+              : spatialData
+                ? `Showing ${spatialData.scaleLabel.toLowerCase()} detail.`
+                : regionalData
+                  ? 'Showing the UK regional overview.'
+                  : location.label}
+          </p>
           <span>
-            {spatialData
+            {forecastMode
+              ? 'Forecast playback uses Open-Meteo hourly data at 11 km granularity.'
+              : spatialData
               ? 'Move or zoom the map to update the active pollen cell.'
               : regionalData
               ? 'Search or move the map to inspect a region. Location access is not required for this view.'
@@ -878,11 +1134,9 @@ function PollenMap({
       <div className="map-dock">
         <div
           className="map-legend"
-          aria-label="Pollen score color scale from 0 to 100"
+          aria-label="Pollen score color scale"
         >
-          <span aria-hidden="true">0</span>
           <span className={`legend-ramp ${!hasVisibleLayer ? 'flat' : ''}`} aria-hidden="true" />
-          <span aria-hidden="true">100</span>
         </div>
       </div>
     </section>
@@ -899,6 +1153,7 @@ function TimelapseControls({
   onOffsetChange,
   onPlayingChange,
   regionalMode = false,
+  disabledMessage = 'Zoom in to 11 km detail to use forecast playback.',
 }) {
   const roundedMinutes = Math.round((progress * 60) / 15) * 15;
   const offsetLabel =
@@ -913,26 +1168,26 @@ function TimelapseControls({
   return (
     <div
       className={`timelapse-panel ${regionalMode ? 'disabled' : ''}`}
-      aria-label={regionalMode ? 'Daily regional forecast' : 'Timelapse forecast controls'}
+      aria-label={regionalMode ? 'Forecast playback unavailable' : 'Timelapse forecast controls'}
     >
       <div className="panel-title">
-        <span>{regionalMode ? 'Regional forecast' : 'Timelapse'}</span>
+        <span>{regionalMode ? 'Forecast unavailable' : 'Timelapse'}</span>
         <strong>
           {regionalMode
-            ? 'Daily'
+            ? 'Zoom in'
             : `${offsetLabel}${frame?.time ? ` · ${formatFrameTime(frame.time, 15)}` : ''}`}
         </strong>
       </div>
       <div className="timelapse-actions">
         <button
-          className="icon-button"
+          className={`icon-button ${loading ? 'loading' : ''}`}
           type="button"
           onClick={() => onPlayingChange(!playing)}
           disabled={loading || regionalMode}
-          aria-label={playing ? 'Pause timelapse' : 'Play timelapse'}
-          title={playing ? 'Pause timelapse' : 'Play timelapse'}
+          aria-label={regionalMode ? disabledMessage : loading ? 'Loading forecast tiles' : playing ? 'Pause timelapse' : 'Play timelapse'}
+          title={regionalMode ? disabledMessage : loading ? 'Loading forecast tiles' : playing ? 'Pause timelapse' : 'Play timelapse'}
         >
-          {playing ? <Pause size={16} /> : <Play size={16} />}
+          {loading ? <span className="button-spinner" aria-hidden="true" /> : playing ? <Pause size={16} /> : <Play size={16} />}
         </button>
         <div className="segmented-control" aria-label="Timelapse duration">
           {TIMELAPSE_HORIZONS.map((hours) => (
@@ -992,7 +1247,7 @@ function WeatherPanel({ weather, impact, loading, error }) {
           <strong>{liveWeather.windSpeed ?? 0} km/h</strong>
         </div>
       </div>
-      <p>{error || `${impact.guidance} Weather-adjusted prominence: ${impact.adjustedScore}/100.`}</p>
+      <p>{error || `${impact.guidance} Weather-adjusted prominence: ${formatScore(impact.adjustedScore)}/100.`}</p>
     </section>
   );
 }
@@ -1013,16 +1268,24 @@ function ForecastSnapshot({
   selectedCategory,
   regionalMode = false,
   activeRegion,
+  forecastMode = false,
+  forecastCategory = 'aggregate',
+  forecastFrame,
+  forecastProviders = [],
 }) {
   const [sourcesExpanded, setSourcesExpanded] = useState(false);
   const aggregate = forecast?.ensemble?.aggregate;
   const regionalCategory = selectedCategory || 'aggregate';
-  const selected = regionalMode
+  const selected = forecastMode
+    ? null
+    : regionalMode
     ? activeRegion?.scores?.[regionalCategory]
     : selectedCategory
       ? forecast?.ensemble?.[selectedCategory]
       : null;
-  const providers = regionalMode
+  const providers = forecastMode
+    ? forecastProviders
+    : regionalMode
     ? activeRegion?.providerStatus || []
     : forecast?.providers || [];
   const areaLabel = activeRegion?.scaleLabel
@@ -1034,10 +1297,18 @@ function ForecastSnapshot({
       counts[status] += 1;
       return counts;
     },
-    { ok: 0, 'not-covered': 0, 'no-data': 0 },
+    { ok: 0, 'not-covered': 0, 'no-data': 0, 'no-forecast': 0 },
   );
   const summaryStatus =
     statusCounts.ok > 0 ? 'ok' : statusCounts['not-covered'] > 0 ? 'not-covered' : 'no-data';
+  const forecastScore = frameScore(forecastFrame);
+  const providerStatusText = (provider) => {
+    if (providerDisplayStatus(provider) === 'no-forecast') return 'no forecasting support';
+    if (providerDisplayStatus(provider) === 'ok' && Number.isFinite(provider.weightMultiplier)) {
+      return `${Math.round(provider.weightMultiplier * 100)}% weight`;
+    }
+    return displayStatus(providerDisplayStatus(provider));
+  };
 
   return (
     <section className="forecast-snapshot" aria-label="Pollen forecast data">
@@ -1061,14 +1332,20 @@ function ForecastSnapshot({
         <>
           <div className="source-summary">
             <p>
-              {regionalMode && activeRegion
-                ? `${areaLabel}: ${selected?.label || 'Daily ensemble'} ${selected?.score ?? 0}/100, from ${selected?.signalCount || 0} provider input${selected?.signalCount === 1 ? '' : 's'}.`
+              {error
+                ? error
+                : forecastMode
+                  ? `${categoryLabel(forecastCategory)} hourly forecast: ${
+                    Number.isFinite(forecastScore) ? `${formatScore(forecastScore)}/100` : loading ? 'loading' : 'pending'
+                  }, Open-Meteo only.`
+                : regionalMode && activeRegion
+                ? `${areaLabel}: ${selected?.label || 'Daily ensemble'} ${formatScore(selected?.score)}/100, from ${selected?.signalCount || 0} provider input${selected?.signalCount === 1 ? '' : 's'}.`
                 : selected
-                ? `${selected.label}: ${selected.score}/100, ${scoreLabel(selected.score).toLowerCase()}, from ${selected.signalCount} composite input${selected.signalCount === 1 ? '' : 's'}.`
+                ? `${selected.label}: ${formatScore(selected.score)}/100, ${scoreLabel(selected.score).toLowerCase()}, from ${selected.signalCount} composite input${selected.signalCount === 1 ? '' : 's'}.`
                 : error || 'Select an allergen to inspect its composite forecast.'}
             </p>
             {!regionalMode && selected && aggregate && selected.key !== 'aggregate' && (
-              <p>Worst: {aggregate.score}/100, {scoreLabel(aggregate.score).toLowerCase()}.</p>
+              <p>Worst allergen: {formatScore(aggregate.score)}/100, {scoreLabel(aggregate.score).toLowerCase()}.</p>
             )}
           </div>
           <div className="provider-row" aria-label="Provider status">
@@ -1087,16 +1364,16 @@ function ForecastSnapshot({
               >
                 <Database size={16} />
                 <span>{provider.name}</span>
-                <strong>
-                  {providerDisplayStatus(provider) === 'ok' && Number.isFinite(provider.weightMultiplier)
-                    ? `${Math.round(provider.weightMultiplier * 100)}% weight`
-                    : displayStatus(providerDisplayStatus(provider))}
-                </strong>
+                <strong>{providerStatusText(provider)}</strong>
               </div>
             ))}
           </div>
           <div className="ensemble-details" aria-label="Composite data inputs">
-            {selected?.signals?.length ? (
+            {forecastMode ? (
+              <p className="empty-detail">
+                Hourly playback uses Open-Meteo 11 km forecast tiles. Other sources are not included in this forecast mode.
+              </p>
+            ) : selected?.signals?.length ? (
               selected.signals.map((signal) => (
               <article className="signal-card" key={`${signal.providerId}-${signal.category}`}>
                 <div title={signal.sourceDetail}>
@@ -1105,7 +1382,7 @@ function ForecastSnapshot({
                 <dl>
                   <div>
                     <dt>Score</dt>
-                    <dd>{signal.score}/100</dd>
+                    <dd>{formatScore(signal.score)}/100</dd>
                   </div>
                   <div>
                     <dt>Index</dt>
@@ -1256,7 +1533,7 @@ function CategoryTiles({ categories, selectedCategory, onSelect, disabled = fals
         title={disabled ? 'Allergen filters are paused while the regional ensemble is evaluated.' : undefined}
       >
         <span className="category-label">{category.label}</span>
-        <strong>{category.score}/100</strong>
+        <strong>{formatScore(category.score)}/100</strong>
       </button>
     );
   };
@@ -1276,6 +1553,35 @@ function CategoryTiles({ categories, selectedCategory, onSelect, disabled = fals
       </div>
     </section>
   );
+}
+
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error) {
+    console.error(error);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <main className="app-shell">
+          <section className="forecast-snapshot" aria-label="Application error">
+            <p>{this.state.error.message || 'The forecast view failed to render.'}</p>
+          </section>
+        </main>
+      );
+    }
+
+    return this.props.children;
+  }
 }
 
 function App() {
@@ -1301,6 +1607,8 @@ function App() {
   const [timelapseHorizon, setTimelapseHorizon] = useState(3);
   const [visualTimeOffset, setVisualTimeOffset] = useState(0);
   const [timelapsePlaying, setTimelapsePlaying] = useState(false);
+  const [forecastPlaybackActive, setForecastPlaybackActive] = useState(false);
+  const [forecastAutoplayPending, setForecastAutoplayPending] = useState(false);
   const [weather, setWeather] = useState(DEFAULT_WEATHER);
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [weatherError, setWeatherError] = useState('');
@@ -1310,6 +1618,20 @@ function App() {
     () => interpolatedFrameFor(gridData, visualTimeOffset),
     [gridData, visualTimeOffset],
   );
+  const forecastCategory = selectedCategory || 'aggregate';
+  const forecastAvailable = mapZoom >= SPATIAL_11KM_ZOOM;
+  const forecastGridReady = Boolean(
+    forecastPlaybackActive &&
+      forecastAvailable &&
+      gridData?.category === forecastCategory &&
+      activeFrame &&
+      !gridLoading &&
+      !gridError,
+  );
+  const forecastPlaybackLoading = Boolean(
+    forecastPlaybackActive && !gridError && !forecastGridReady,
+  );
+  const forecastMapReady = forecastGridReady && !forecastPlaybackLoading;
   const selectedCategoryData = forecast?.ensemble?.[selectedCategory];
   const activeRegion = useMemo(() => {
     if (!regionalData?.regions?.length || !forecastPoint) return null;
@@ -1343,6 +1665,30 @@ function App() {
     setSelectedPlaceLabel(locationResult.label);
     setSearchLocation(locationResult);
   };
+
+  const stopForecastPlayback = () => {
+    setForecastAutoplayPending(false);
+    setForecastPlaybackActive(false);
+    setTimelapsePlaying(false);
+    setGridData(null);
+    setGridLoading(false);
+  };
+
+  const startForecastPlayback = () => {
+    if (!forecastAvailable) return;
+    setForecastPlaybackActive(true);
+    setForecastAutoplayPending(true);
+    setTimelapsePlaying(false);
+    setGridData(null);
+    setGridError('');
+    setVisualTimeOffset(0);
+  };
+
+  useEffect(() => {
+    if (!forecastAvailable && forecastPlaybackActive) {
+      stopForecastPlayback();
+    }
+  }, [forecastAvailable, forecastPlaybackActive]);
 
   useEffect(() => {
     if (regionalData) {
@@ -1393,6 +1739,12 @@ function App() {
   }, [forecastPoint, regionalData]);
 
   useEffect(() => {
+    if (forecastPlaybackActive) {
+      setSpatialLoading(false);
+      setSpatialError('');
+      return undefined;
+    }
+
     if (!mapBounds || mapZoom < SPATIAL_11KM_ZOOM) {
       setSpatialData(null);
       setSpatialLoading(false);
@@ -1425,10 +1777,10 @@ function App() {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [mapBounds, mapZoom]);
+  }, [forecastPlaybackActive, mapBounds, mapZoom]);
 
   useEffect(() => {
-    if (regionalData || !mapBounds || !selectedCategory) {
+    if (!forecastPlaybackActive || !forecastAvailable || !mapBounds) {
       setGridData(null);
       setGridLoading(false);
       setGridError('');
@@ -1442,13 +1794,18 @@ function App() {
       try {
         const data = await fetchGrid({
           bounds: mapBounds,
-          category: selectedCategory,
+          category: forecastCategory,
           horizonHours: 8,
+          coverage: 'bounds',
           signal: controller.signal,
         });
         setGridData(data);
       } catch (error) {
-        if (error.name !== 'AbortError') setGridError(error.message);
+        if (error.name !== 'AbortError') {
+          setGridError(error.message);
+          setForecastAutoplayPending(false);
+          setTimelapsePlaying(false);
+        }
       } finally {
         if (!controller.signal.aborted) setGridLoading(false);
       }
@@ -1458,7 +1815,7 @@ function App() {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [regionalData, mapBounds, selectedCategory]);
+  }, [forecastPlaybackActive, forecastAvailable, forecastCategory, mapBounds]);
 
   useEffect(() => {
     if (!mapBounds || !forecastPoint) return;
@@ -1492,7 +1849,18 @@ function App() {
 
   useEffect(() => {
     setVisualTimeOffset(0);
-  }, [selectedCategory, timelapseHorizon]);
+  }, [forecastCategory, timelapseHorizon]);
+
+  useEffect(() => {
+    if (forecastAutoplayPending && forecastGridReady) {
+      setForecastAutoplayPending(false);
+      const frameId = window.requestAnimationFrame(() => {
+        setTimelapsePlaying(true);
+      });
+      return () => window.cancelAnimationFrame(frameId);
+    }
+    return undefined;
+  }, [forecastAutoplayPending, forecastGridReady]);
 
   useEffect(() => {
     visualTimeOffsetRef.current = visualTimeOffset;
@@ -1508,6 +1876,7 @@ function App() {
     let startTime = window.performance.now();
     let startOffset = clamp(visualTimeOffsetRef.current, 0, timelapseHorizon);
     let frameId = 0;
+    let lastUpdateTime = 0;
 
     const tick = (now) => {
       const elapsed = now - startTime;
@@ -1523,7 +1892,10 @@ function App() {
         }
       }
 
-      setVisualTimeOffset(progress);
+      if (now - lastUpdateTime >= 160 || progress === timelapseHorizon || progress === 0) {
+        lastUpdateTime = now;
+        setVisualTimeOffset(progress);
+      }
       frameId = window.requestAnimationFrame(tick);
     };
 
@@ -1538,7 +1910,7 @@ function App() {
         categories={regionalCategories.length ? regionalCategories : forecast?.categories}
         selectedCategory={selectedCategory}
         onSelect={(category) => {
-          setTimelapsePlaying(false);
+          stopForecastPlayback();
           setSelectedCategory((selected) => (selected === category ? null : category));
         }}
       />
@@ -1554,6 +1926,8 @@ function App() {
         onZoomChange={setMapZoom}
         selectedCategory={selectedCategory}
         selectedCategoryData={selectedCategoryData}
+        forecastMode={forecastMapReady}
+        forecastCategory={forecastCategory}
         gridData={gridData}
         gridLoading={gridLoading}
         timeProgress={visualTimeOffset}
@@ -1572,18 +1946,25 @@ function App() {
           horizon={timelapseHorizon}
           progress={visualTimeOffset}
           playing={timelapsePlaying}
-          loading={gridLoading || gridData?.category !== selectedCategory}
+          loading={forecastPlaybackLoading}
           frame={activeFrame}
+          regionalMode={!forecastAvailable}
+          disabledMessage="Forecast playback is available from 11 km detail zoom."
           onHorizonChange={(hours) => {
-            setTimelapsePlaying(false);
+            stopForecastPlayback();
             setTimelapseHorizon(hours);
           }}
           onOffsetChange={(offset) => {
-            setTimelapsePlaying(false);
+            stopForecastPlayback();
             setVisualTimeOffset(offset);
           }}
-          onPlayingChange={setTimelapsePlaying}
-          regionalMode
+          onPlayingChange={(playing) => {
+            if (playing) {
+              startForecastPlayback();
+              return;
+            }
+            stopForecastPlayback();
+          }}
         />
         <WeatherPanel
           weather={weather}
@@ -1597,14 +1978,25 @@ function App() {
         loading={forecastLoading}
         error={forecastError || gridError}
         selectedCategory={selectedCategory}
-        regionalMode
+        regionalMode={!forecastMapReady}
         activeRegion={activeArea}
+        forecastMode={forecastMapReady}
+        forecastCategory={forecastCategory}
+        forecastFrame={activeFrame}
+        forecastProviders={FORECAST_PROVIDER_STATUSES}
       />
     </main>
   );
 }
 
 const rootElement = document.getElementById('root');
-const root = globalThis.__pollenForecastRoot || createRoot(rootElement);
-globalThis.__pollenForecastRoot = root;
-root.render(<App />);
+if (globalThis.__pollenForecastRootElement !== rootElement) {
+  globalThis.__pollenForecastRoot?.unmount?.();
+  globalThis.__pollenForecastRoot = createRoot(rootElement);
+  globalThis.__pollenForecastRootElement = rootElement;
+}
+globalThis.__pollenForecastRoot.render(
+  <AppErrorBoundary>
+    <App />
+  </AppErrorBoundary>,
+);
