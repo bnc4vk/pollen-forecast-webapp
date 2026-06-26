@@ -43,8 +43,19 @@ jobs:
         env:
           EXPECTED_SHA: ${{ github.sha }}
         run: |
-          response="$(curl --fail --retry 6 --retry-delay 5 --silent --show-error \
-            "https://pollen-forecast-api.bnc4vk-pollen.workers.dev/api/health?sha=${EXPECTED_SHA}")"
+          for attempt in {1..12}; do
+            response="$(curl --fail --silent --show-error \
+              "https://pollen-forecast-api.bnc4vk-pollen.workers.dev/api/health?sha=${EXPECTED_SHA}")"
+            if echo "$response" | jq --exit-status --arg sha "$EXPECTED_SHA" \
+              '.ok == true and .deploySha == $sha' >/dev/null; then
+              echo "$response"
+              exit 0
+            fi
+            echo "Worker has not reported ${EXPECTED_SHA} yet; retrying (${attempt}/12)."
+            echo "$response"
+            sleep 5
+          done
+
           echo "$response" | jq --exit-status --arg sha "$EXPECTED_SHA" \
             '.ok == true and .deploySha == $sha'
 
