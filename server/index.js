@@ -140,11 +140,17 @@ const SPATIAL_SCALE_CONFIG = {
 };
 
 const cache = new Map();
+const openMeteoProviderCache = new Map();
+const openMeteoProviderPending = new Map();
+const googleProviderCache = new Map();
+const googleProviderPending = new Map();
 const pollenInformationCache = new Map();
 const pollenInformationPending = new Map();
 const regionalForecastContexts = new Map();
 const regionalForecastContextPending = new Map();
 const spatialCellForecastCache = new Map();
+const spatialForecastPending = new Map();
+const openMeteoGridPending = new Map();
 let metOfficePageCache = null;
 let metOfficePolygonsCache = null;
 
@@ -159,6 +165,38 @@ function parseCoord(value, fallback) {
 
 function roundCoord(value) {
   return Math.round(value * 1000) / 1000;
+}
+
+async function cachedProvider(cacheMap, pendingMap, cacheKey, ttlMs, fetcher) {
+  const cached = cacheMap.get(cacheKey);
+  if (cached && Date.now() - cached.created < ttlMs) return cached.value;
+  let pending = pendingMap.get(cacheKey);
+  if (!pending) {
+    pending = fetcher()
+      .then((value) => {
+        cacheMap.set(cacheKey, { created: Date.now(), value });
+        return value;
+      })
+      .finally(() => {
+        pendingMap.delete(cacheKey);
+      });
+    pendingMap.set(cacheKey, pending);
+  }
+  return pending;
+}
+
+function cachedOpenMeteo(lat, lng) {
+  const cacheKey = `openmeteo:${roundCoord(lat)}:${roundCoord(lng)}`;
+  return cachedProvider(openMeteoProviderCache, openMeteoProviderPending, cacheKey, 30 * 60 * 1000, () =>
+    fetchOpenMeteo(lat, lng),
+  );
+}
+
+function cachedGooglePollen(lat, lng) {
+  const cacheKey = `google:${roundCoord(lat)}:${roundCoord(lng)}`;
+  return cachedProvider(googleProviderCache, googleProviderPending, cacheKey, 4 * 60 * 60 * 1000, () =>
+    fetchGooglePollen(lat, lng),
+  );
 }
 
 function rawConcentrationToIndex(value) {
@@ -1298,8 +1336,8 @@ async function buildSpatialCellForecast(cell, tier) {
   let directProviders;
   if (tier === '11km') {
     const settled = await Promise.allSettled([
-      fetchOpenMeteo(cell.lat, cell.lng),
-      fetchGooglePollen(cell.lat, cell.lng),
+      cachedOpenMeteo(cell.lat, cell.lng),
+      cachedGooglePollen(cell.lat, cell.lng),
     ]);
     directProviders = settled.map((result, index) =>
       result.status === 'fulfilled'
@@ -1313,8 +1351,8 @@ async function buildSpatialCellForecast(cell, tier) {
   } else {
     const parent = spatialCellForPoint(cell.lat, cell.lng, 11);
     const settled = await Promise.allSettled([
-      fetchOpenMeteo(parent.lat, parent.lng),
-      fetchGooglePollen(cell.lat, cell.lng),
+      cachedOpenMeteo(parent.lat, parent.lng),
+      cachedGooglePollen(parent.lat, parent.lng),
     ]);
     directProviders = settled.map((result, index) =>
       result.status === 'fulfilled'
@@ -1335,8 +1373,8 @@ async function buildSpatialCellForecast(cell, tier) {
       cloneProviderWithWeight(
         provider,
         tier,
-        tier === '1km' && provider.id === 'openmeteo'
-          ? 'inherited from containing 11 km CAMS cell'
+        tier === '1km' && ['openmeteo', 'google'].includes(provider.id)
+          ? 'inherited from containing 11 km cell'
           : `requested at ${SPATIAL_SCALE_CONFIG[tier].label} center`,
       ),
     ),
@@ -1393,15 +1431,15 @@ async function buildSpatialForecast(bounds, zoom) {
       'Met Office and Austrian signals are inherited from the containing regional context.',
       tier === '11km'
         ? 'Open-Meteo and Google are requested at each 11 km cell center.'
-        : 'Google is requested at each 1 km cell center; Open-Meteo is inherited from the containing 11 km cell.',
+        : 'Open-Meteo and Google are inherited from the containing 11 km cell to limit provider calls while preserving the 1 km visual grid.',
     ],
   };
 }
 
 async function buildForecast(lat, lng) {
   const settled = await Promise.allSettled([
-    fetchOpenMeteo(lat, lng),
-    fetchGooglePollen(lat, lng),
+    cachedOpenMeteo(lat, lng),
+    cachedGooglePollen(lat, lng),
     fetchPollenInformation(lat, lng),
     fetchMetOfficePollen(lat, lng),
   ]);
@@ -1559,7 +1597,14 @@ app.get('/api/spatial', async (req, res) => {
   }
 
   try {
-    const value = await buildSpatialForecast(bounds, zoom);
+    let pending = spatialForecastPending.get(cacheKey);
+    if (!pending) {
+      pending = buildSpatialForecast(bounds, zoom).finally(() => {
+        spatialForecastPending.delete(cacheKey);
+      });
+      spatialForecastPending.set(cacheKey, pending);
+    }
+    const value = await pending;
     cache.set(cacheKey, { created: Date.now(), value });
     res.json(value);
   } catch (error) {
@@ -1600,7 +1645,14 @@ app.get('/api/grid', async (req, res) => {
   }
 
   try {
-    const value = await fetchOpenMeteoGrid(bounds, category, horizonHours, { coverage });
+    let pending = openMeteoGridPending.get(cacheKey);
+    if (!pending) {
+      pending = fetchOpenMeteoGrid(bounds, category, horizonHours, { coverage }).finally(() => {
+        openMeteoGridPending.delete(cacheKey);
+      });
+      openMeteoGridPending.set(cacheKey, pending);
+    }
+    const value = await pending;
     cache.set(cacheKey, { created: Date.now(), value });
     res.json(value);
   } catch (error) {

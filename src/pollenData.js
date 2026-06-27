@@ -52,9 +52,30 @@ const OPEN_METEO_COORDINATE_BATCH_SIZE = 300;
 const WEATHER_GRID_ROWS = 4;
 const WEATHER_GRID_COLS = 4;
 const openMeteoGridCache = new Map();
+const apiResponseCache = new Map();
+const apiPendingRequests = new Map();
+const API_CACHE_MAX_ENTRIES = 160;
+const API_CACHE_TTL = {
+  '/api/forecast': 5 * 60 * 1000,
+  '/api/regions': 4 * 60 * 60 * 1000,
+  '/api/spatial': 4 * 60 * 60 * 1000,
+  '/api/grid': 5 * 60 * 1000,
+  '/api/weather': 2 * 60 * 1000,
+};
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function roundedParam(value, precision = 3) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(precision) : String(value);
+}
+
+function roundedBoundsParams(bounds, precision = 3) {
+  return Object.fromEntries(
+    Object.entries(bounds || {}).map(([key, value]) => [key, roundedParam(value, precision)]),
+  );
 }
 
 function categoryName(key) {
@@ -817,15 +838,59 @@ function apiUrl(path, params) {
   return `${API_BASE_URL}${path}?${query}`;
 }
 
+function pruneApiCache(now = Date.now()) {
+  for (const [url, cached] of apiResponseCache) {
+    const path = new URL(url, window.location.origin).pathname;
+    const ttl = API_CACHE_TTL[path] || 0;
+    if (!ttl || now - cached.created >= ttl) apiResponseCache.delete(url);
+  }
+
+  while (apiResponseCache.size > API_CACHE_MAX_ENTRIES) {
+    const oldestKey = apiResponseCache.keys().next().value;
+    apiResponseCache.delete(oldestKey);
+  }
+}
+
 async function fetchApiJson(path, params, signal) {
-  const response = await fetch(apiUrl(path, params), { signal });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `Unable to load ${path}`);
-  return data;
+  const url = apiUrl(path, params);
+  const ttl = API_CACHE_TTL[path] || 0;
+  pruneApiCache();
+  const cached = apiResponseCache.get(url);
+  if (cached && Date.now() - cached.created < ttl) return cached.data;
+
+  let pending = apiPendingRequests.get(url);
+  if (!pending) {
+    pending = fetch(url)
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `Unable to load ${path}`);
+        if (ttl > 0) apiResponseCache.set(url, { created: Date.now(), data });
+        return data;
+      })
+      .finally(() => {
+        apiPendingRequests.delete(url);
+      });
+    apiPendingRequests.set(url, pending);
+  }
+
+  if (!signal) return pending;
+  if (signal.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new DOMException('The operation was aborted.', 'AbortError'));
+    signal.addEventListener('abort', abort, { once: true });
+    pending.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', abort);
+    });
+  });
 }
 
 export function fetchForecast({ lat, lng, signal }) {
-  if (HAS_API_BASE || USE_LOCAL_API) return fetchApiJson('/api/forecast', { lat, lng }, signal);
+  if (HAS_API_BASE || USE_LOCAL_API) {
+    return fetchApiJson('/api/forecast', {
+      lat: roundedParam(lat),
+      lng: roundedParam(lng),
+    }, signal);
+  }
   return buildBrowserForecast(lat, lng);
 }
 
@@ -837,9 +902,7 @@ export function fetchRegions({ signal } = {}) {
 export function fetchSpatial({ bounds, zoom, signal }) {
   if (HAS_API_BASE || USE_LOCAL_API) {
     return fetchApiJson('/api/spatial', {
-      ...Object.fromEntries(
-        Object.entries(bounds).map(([key, value]) => [key, String(Number(value).toFixed(5))]),
-      ),
+      ...roundedBoundsParams(bounds),
       zoom: String(Number(zoom).toFixed(2)),
     }, signal);
   }
@@ -849,9 +912,7 @@ export function fetchSpatial({ bounds, zoom, signal }) {
 export function fetchGrid({ bounds, category, horizonHours = MAX_TIMELAPSE_HOURS, coverage = 'bounds', signal }) {
   if (HAS_API_BASE || USE_LOCAL_API) {
     return fetchApiJson('/api/grid', {
-      ...Object.fromEntries(
-        Object.entries(bounds).map(([key, value]) => [key, String(Number(value).toFixed(5))]),
-      ),
+      ...roundedBoundsParams(bounds),
       category,
       horizonHours,
       coverage,
@@ -863,11 +924,9 @@ export function fetchGrid({ bounds, category, horizonHours = MAX_TIMELAPSE_HOURS
 export function fetchWeather({ lat, lng, bounds, signal }) {
   if (HAS_API_BASE || USE_LOCAL_API) {
     return fetchApiJson('/api/weather', {
-      lat,
-      lng,
-      ...Object.fromEntries(
-        Object.entries(bounds || {}).map(([key, value]) => [key, String(Number(value).toFixed(5))]),
-      ),
+      lat: roundedParam(lat),
+      lng: roundedParam(lng),
+      ...roundedBoundsParams(bounds),
     }, signal);
   }
   return buildBrowserWeather(Number(lat), Number(lng), bounds);

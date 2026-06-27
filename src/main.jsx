@@ -209,6 +209,21 @@ function formatScore(score) {
   return Number.isFinite(value) ? String(Math.round(value)) : '0';
 }
 
+function requestCoord(value, precision = 3) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(precision) : '';
+}
+
+function boundsRequestKey(bounds) {
+  if (!bounds) return '';
+  return ['north', 'south', 'east', 'west'].map((key) => requestCoord(bounds[key])).join(':');
+}
+
+function pointRequestKey(point) {
+  if (!point) return '';
+  return `${requestCoord(point.lat)}:${requestCoord(point.lng)}`;
+}
+
 function weatherProminence(weather, score) {
   const liveWeather = weather || DEFAULT_WEATHER;
   const rain = liveWeather.rain || DEFAULT_WEATHER.rain;
@@ -1111,7 +1126,9 @@ function PollenMap({
       {location.source !== 'precise' && !selectedPlaceLabel && (
         <div className="permission-panel" role="status" aria-live="polite">
           <p>
-            {forecastMode && forecastGridData
+            {gridLoading
+              ? 'Loading 11 km forecast tiles.'
+              : forecastMode && forecastGridData
               ? `Showing ${forecastGridData.scaleLabel.toLowerCase()}s.`
               : spatialData
                 ? `Showing ${spatialData.scaleLabel.toLowerCase()} detail.`
@@ -1120,7 +1137,9 @@ function PollenMap({
                   : location.label}
           </p>
           <span>
-            {forecastMode
+            {gridLoading
+              ? 'Playback will start once the current map view has loaded.'
+              : forecastMode
               ? 'Forecast playback uses Open-Meteo hourly data at 11 km granularity.'
               : spatialData
               ? 'Move or zoom the map to update the active pollen cell.'
@@ -1418,6 +1437,7 @@ function ForecastSnapshot({
 
 function LocationSearch({ onSelect }) {
   const [query, setQuery] = useState('');
+  const [committedQuery, setCommittedQuery] = useState('');
   const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [open, setOpen] = useState(false);
@@ -1429,6 +1449,10 @@ function LocationSearch({ onSelect }) {
       if (trimmedQuery.length < 2) {
         setResults([]);
         setOpen(false);
+        setSearching(false);
+        return;
+      }
+      if (trimmedQuery === committedQuery.trim()) {
         setSearching(false);
         return;
       }
@@ -1452,16 +1476,18 @@ function LocationSearch({ onSelect }) {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [query]);
+  }, [committedQuery, query]);
 
   const chooseResult = (result) => {
     setQuery(result.label);
+    setCommittedQuery(result.label);
     setOpen(false);
     onSelect(result);
   };
 
   const updateQuery = (value) => {
     const fallbackResults = value.trim().length >= 2 ? fallbackLocations(value) : [];
+    setCommittedQuery('');
     setQuery(value);
     setResults(fallbackResults);
     setOpen(fallbackResults.length > 0);
@@ -1484,7 +1510,11 @@ function LocationSearch({ onSelect }) {
         type="search"
         value={query}
         onChange={(event) => updateQuery(event.target.value)}
-        onFocus={() => setOpen(results.length > 0)}
+        onFocus={() => setOpen(results.length > 0 && query.trim() !== committedQuery.trim())}
+        onBlur={() => window.setTimeout(() => setOpen(false), 120)}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') setOpen(false);
+        }}
         placeholder="Search location"
         aria-controls="location-search-results"
         aria-expanded={open}
@@ -1613,12 +1643,17 @@ function App() {
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [weatherError, setWeatherError] = useState('');
   const visualTimeOffsetRef = useRef(0);
+  const timelapsePlayingRef = useRef(false);
+  const forecastAutoplayPendingRef = useRef(false);
 
   const activeFrame = useMemo(
     () => interpolatedFrameFor(gridData, visualTimeOffset),
     [gridData, visualTimeOffset],
   );
   const forecastCategory = selectedCategory || 'aggregate';
+  const forecastPointKey = useMemo(() => pointRequestKey(forecastPoint), [forecastPoint]);
+  const mapBoundsKey = useMemo(() => boundsRequestKey(mapBounds), [mapBounds]);
+  const mapZoomKey = Number.isFinite(Number(mapZoom)) ? Number(mapZoom).toFixed(2) : '';
   const forecastAvailable = mapZoom >= SPATIAL_11KM_ZOOM;
   const forecastGridReady = Boolean(
     forecastPlaybackActive &&
@@ -1687,6 +1722,7 @@ function App() {
   useEffect(() => {
     if (!forecastAvailable && forecastPlaybackActive) {
       stopForecastPlayback();
+      setVisualTimeOffset(0);
     }
   }, [forecastAvailable, forecastPlaybackActive]);
 
@@ -1736,7 +1772,7 @@ function App() {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [forecastPoint, regionalData]);
+  }, [forecastPointKey, regionalData]);
 
   useEffect(() => {
     if (forecastPlaybackActive) {
@@ -1777,7 +1813,7 @@ function App() {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [forecastPlaybackActive, mapBounds, mapZoom]);
+  }, [forecastPlaybackActive, mapBoundsKey, mapZoomKey]);
 
   useEffect(() => {
     if (!forecastPlaybackActive || !forecastAvailable || !mapBounds) {
@@ -1788,6 +1824,11 @@ function App() {
     }
 
     const controller = new AbortController();
+    const resumeAfterLoad = timelapsePlayingRef.current || forecastAutoplayPendingRef.current;
+    if (resumeAfterLoad) {
+      setTimelapsePlaying(false);
+      setForecastAutoplayPending(true);
+    }
     const timeout = window.setTimeout(async () => {
       setGridLoading(true);
       setGridError('');
@@ -1815,7 +1856,7 @@ function App() {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [forecastPlaybackActive, forecastAvailable, forecastCategory, mapBounds]);
+  }, [forecastPlaybackActive, forecastAvailable, forecastCategory, mapBoundsKey]);
 
   useEffect(() => {
     if (!mapBounds || !forecastPoint) return;
@@ -1845,7 +1886,7 @@ function App() {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [forecastPoint, mapBounds]);
+  }, [forecastPointKey, mapBoundsKey]);
 
   useEffect(() => {
     setVisualTimeOffset(0);
@@ -1854,10 +1895,7 @@ function App() {
   useEffect(() => {
     if (forecastAutoplayPending && forecastGridReady) {
       setForecastAutoplayPending(false);
-      const frameId = window.requestAnimationFrame(() => {
-        setTimelapsePlaying(true);
-      });
-      return () => window.cancelAnimationFrame(frameId);
+      setTimelapsePlaying(true);
     }
     return undefined;
   }, [forecastAutoplayPending, forecastGridReady]);
@@ -1865,6 +1903,14 @@ function App() {
   useEffect(() => {
     visualTimeOffsetRef.current = visualTimeOffset;
   }, [visualTimeOffset]);
+
+  useEffect(() => {
+    timelapsePlayingRef.current = timelapsePlaying;
+  }, [timelapsePlaying]);
+
+  useEffect(() => {
+    forecastAutoplayPendingRef.current = forecastAutoplayPending;
+  }, [forecastAutoplayPending]);
 
   useEffect(() => {
     if (!timelapsePlaying) {
