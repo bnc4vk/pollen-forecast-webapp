@@ -224,20 +224,10 @@ function pointRequestKey(point) {
   return `${requestCoord(point.lat)}:${requestCoord(point.lng)}`;
 }
 
-function weatherProminence(weather, score) {
+function weatherProminence(weather) {
   const liveWeather = weather || DEFAULT_WEATHER;
-  const rain = liveWeather.rain || DEFAULT_WEATHER.rain;
-  const wind = liveWeather.wind || DEFAULT_WEATHER.wind;
-  const multiplier = clamp(Number(liveWeather.multiplier ?? rain.multiplier * wind.multiplier) || 1, 0.55, 1.65);
-  const adjustedScore = Math.round(clamp((Number(score) || 0) * multiplier, 0, 100));
-  const direction = multiplier < 0.9 ? 'lower' : multiplier > 1.12 ? 'higher' : 'similar';
 
   return {
-    rain,
-    wind,
-    multiplier,
-    adjustedScore,
-    direction,
     guidance: liveWeather.guidance || DEFAULT_WEATHER.guidance,
   };
 }
@@ -585,7 +575,7 @@ function PollenMap({
       attributionControl: true,
     }).setView([location.lat, location.lng], REGIONAL_ZOOM);
 
-    map.zoomControl.setPosition('topright');
+    map.zoomControl.setPosition('bottomright');
     map.attributionControl.setPosition('bottomleft');
     map.attributionControl.setPrefix(false);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -1266,7 +1256,7 @@ function WeatherPanel({ weather, impact, loading, error }) {
           <strong>{liveWeather.windSpeed ?? 0} km/h</strong>
         </div>
       </div>
-      <p>{error || `${impact.guidance} Weather-adjusted prominence: ${formatScore(impact.adjustedScore)}/100.`}</p>
+      <p>{error || impact.guidance}</p>
     </section>
   );
 }
@@ -1660,13 +1650,12 @@ function App() {
       forecastAvailable &&
       gridData?.category === forecastCategory &&
       activeFrame &&
-      !gridLoading &&
       !gridError,
   );
   const forecastPlaybackLoading = Boolean(
-    forecastPlaybackActive && !gridError && !forecastGridReady,
+    forecastPlaybackActive && !gridError && (gridLoading || !forecastGridReady),
   );
-  const forecastMapReady = forecastGridReady && !forecastPlaybackLoading;
+  const forecastMapReady = forecastGridReady;
   const selectedCategoryData = forecast?.ensemble?.[selectedCategory];
   const activeRegion = useMemo(() => {
     if (!regionalData?.regions?.length || !forecastPoint) return null;
@@ -1690,10 +1679,9 @@ function App() {
   }, [spatialData, forecastPoint]);
   const activeArea = activeCell || activeRegion;
   const regionalCategories = useMemo(() => regionalCategoryList(activeArea), [activeArea]);
-  const activeRegionalScore = activeArea?.scores?.[selectedCategory || 'aggregate'];
   const weatherImpact = useMemo(
-    () => weatherProminence(weather, activeRegionalScore?.score),
-    [weather, activeRegionalScore?.score],
+    () => weatherProminence(weather),
+    [weather],
   );
 
   const selectSearchLocation = (locationResult) => {
