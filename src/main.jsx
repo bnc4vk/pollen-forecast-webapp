@@ -1695,6 +1695,7 @@ function App() {
     setTimelapsePlaying(false);
     setGridData(null);
     setGridLoading(false);
+    setSpatialData(null);
   };
 
   const startForecastPlayback = () => {
@@ -1703,8 +1704,26 @@ function App() {
     setForecastAutoplayPending(true);
     setTimelapsePlaying(false);
     setGridData(null);
+    setSpatialData(null);
     setGridError('');
     setVisualTimeOffset(0);
+  };
+
+  const selectCategory = (category) => {
+    const nextCategory = selectedCategory === category ? null : category;
+
+    if (forecastPlaybackActive && forecastAvailable) {
+      setSelectedCategory(nextCategory);
+      setGridData(null);
+      setSpatialData(null);
+      setGridError('');
+      setTimelapsePlaying(false);
+      setForecastAutoplayPending(true);
+      return;
+    }
+
+    stopForecastPlayback();
+    setSelectedCategory(nextCategory);
   };
 
   useEffect(() => {
@@ -1764,6 +1783,7 @@ function App() {
 
   useEffect(() => {
     if (forecastPlaybackActive) {
+      setSpatialData(null);
       setSpatialLoading(false);
       setSpatialError('');
       return undefined;
@@ -1943,10 +1963,7 @@ function App() {
       <CategoryTiles
         categories={regionalCategories.length ? regionalCategories : forecast?.categories}
         selectedCategory={selectedCategory}
-        onSelect={(category) => {
-          stopForecastPlayback();
-          setSelectedCategory((selected) => (selected === category ? null : category));
-        }}
+        onSelect={selectCategory}
       />
       <PollenMap
         location={location}
@@ -1960,7 +1977,7 @@ function App() {
         onZoomChange={setMapZoom}
         selectedCategory={selectedCategory}
         selectedCategoryData={selectedCategoryData}
-        forecastMode={forecastMapReady}
+        forecastMode={forecastPlaybackActive && forecastAvailable}
         forecastCategory={forecastCategory}
         gridData={gridData}
         gridLoading={gridLoading}
