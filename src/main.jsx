@@ -19,6 +19,7 @@ const LONDON = { lat: 51.5074, lng: -0.1278 };
 const DEFAULT_ZOOM = 12;
 const REGIONAL_ZOOM = 5;
 const SPATIAL_11KM_ZOOM = 9.5;
+const SPATIAL_1KM_ZOOM = 13;
 const INITIAL_BOUNDS = {
   north: 51.7,
   south: 51.3,
@@ -222,6 +223,12 @@ function boundsRequestKey(bounds) {
 function pointRequestKey(point) {
   if (!point) return '';
   return `${requestCoord(point.lat)}:${requestCoord(point.lng)}`;
+}
+
+function spatialTierForZoom(zoom) {
+  if (zoom >= SPATIAL_1KM_ZOOM) return '1km';
+  if (zoom >= SPATIAL_11KM_ZOOM) return '11km';
+  return 'regional';
 }
 
 function weatherProminence(weather) {
@@ -1644,7 +1651,10 @@ function App() {
   const forecastPointKey = useMemo(() => pointRequestKey(forecastPoint), [forecastPoint]);
   const mapBoundsKey = useMemo(() => boundsRequestKey(mapBounds), [mapBounds]);
   const mapZoomKey = Number.isFinite(Number(mapZoom)) ? Number(mapZoom).toFixed(2) : '';
+  const spatialTier = spatialTierForZoom(mapZoom);
+  const spatialRequestKey = `${spatialTier}:${mapBoundsKey}`;
   const forecastAvailable = mapZoom >= SPATIAL_11KM_ZOOM;
+  const currentSpatialData = spatialData?.requestKey === spatialRequestKey ? spatialData : null;
   const forecastGridReady = Boolean(
     forecastPlaybackActive &&
       forecastAvailable &&
@@ -1668,15 +1678,15 @@ function App() {
     );
   }, [regionalData, forecastPoint]);
   const activeCell = useMemo(() => {
-    if (!spatialData?.cells?.length || !forecastPoint) return null;
+    if (!currentSpatialData?.cells?.length || !forecastPoint) return null;
     return (
-      spatialData.cells.find((cell) => cellContainsPoint(cell, forecastPoint)) ||
-      spatialData.cells.reduce((nearest, cell) => {
+      currentSpatialData.cells.find((cell) => cellContainsPoint(cell, forecastPoint)) ||
+      currentSpatialData.cells.reduce((nearest, cell) => {
         const distance = (cell.lat - forecastPoint.lat) ** 2 + (cell.lng - forecastPoint.lng) ** 2;
         return !nearest || distance < nearest.distance ? { ...cell, distance } : nearest;
       }, null)
     );
-  }, [spatialData, forecastPoint]);
+  }, [currentSpatialData, forecastPoint]);
   const activeArea = activeCell || activeRegion;
   const regionalCategories = useMemo(() => regionalCategoryList(activeArea), [activeArea]);
   const weatherImpact = useMemo(
@@ -1764,6 +1774,7 @@ function App() {
 
   useEffect(() => {
     if (forecastPlaybackActive) {
+      setSpatialData(null);
       setSpatialLoading(false);
       setSpatialError('');
       return undefined;
@@ -1777,6 +1788,7 @@ function App() {
     }
 
     const controller = new AbortController();
+    setSpatialData((current) => (current?.requestKey === spatialRequestKey ? current : null));
     const timeout = window.setTimeout(async () => {
       setSpatialLoading(true);
       setSpatialError('');
@@ -1786,7 +1798,7 @@ function App() {
           zoom: mapZoom,
           signal: controller.signal,
         });
-        setSpatialData(data);
+        setSpatialData({ ...data, requestKey: spatialRequestKey });
       } catch (error) {
         if (error.name !== 'AbortError') {
           setSpatialError(error.message);
@@ -1801,7 +1813,7 @@ function App() {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [forecastPlaybackActive, mapBoundsKey, mapZoomKey]);
+  }, [forecastPlaybackActive, mapBoundsKey, mapZoomKey, spatialRequestKey]);
 
   useEffect(() => {
     if (!forecastPlaybackActive || !forecastAvailable || !mapBounds) {
@@ -1970,7 +1982,7 @@ function App() {
         regionalLoading={regionalLoading}
         regionalError={regionalError}
         activeRegion={activeRegion}
-        spatialData={spatialData}
+        spatialData={currentSpatialData}
         spatialLoading={spatialLoading}
         spatialError={spatialError}
         activeCell={activeCell}
