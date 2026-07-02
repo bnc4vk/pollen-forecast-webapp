@@ -1636,19 +1636,27 @@ function App() {
   const timelapsePlayingRef = useRef(false);
   const forecastAutoplayPendingRef = useRef(false);
 
-  const activeFrame = useMemo(
-    () => interpolatedFrameFor(gridData, visualTimeOffset),
-    [gridData, visualTimeOffset],
-  );
   const forecastCategory = selectedCategory || 'aggregate';
   const forecastPointKey = useMemo(() => pointRequestKey(forecastPoint), [forecastPoint]);
   const mapBoundsKey = useMemo(() => boundsRequestKey(mapBounds), [mapBounds]);
   const mapZoomKey = Number.isFinite(Number(mapZoom)) ? Number(mapZoom).toFixed(2) : '';
+  const gridDataIsCurrent = Boolean(
+    gridData?.category === forecastCategory && gridData?.boundsKey === mapBoundsKey,
+  );
+  const currentGridData = gridDataIsCurrent ? gridData : null;
+  const spatialDataIsCurrent = Boolean(
+    spatialData?.boundsKey === mapBoundsKey && spatialData?.zoomKey === mapZoomKey,
+  );
+  const currentSpatialData = spatialDataIsCurrent ? spatialData : null;
+  const activeFrame = useMemo(
+    () => interpolatedFrameFor(currentGridData, visualTimeOffset),
+    [currentGridData, visualTimeOffset],
+  );
   const forecastAvailable = mapZoom >= SPATIAL_11KM_ZOOM;
   const forecastGridReady = Boolean(
     forecastPlaybackActive &&
       forecastAvailable &&
-      gridData?.category === forecastCategory &&
+      gridDataIsCurrent &&
       activeFrame &&
       !gridError,
   );
@@ -1668,15 +1676,15 @@ function App() {
     );
   }, [regionalData, forecastPoint]);
   const activeCell = useMemo(() => {
-    if (!spatialData?.cells?.length || !forecastPoint) return null;
+    if (!currentSpatialData?.cells?.length || !forecastPoint) return null;
     return (
-      spatialData.cells.find((cell) => cellContainsPoint(cell, forecastPoint)) ||
-      spatialData.cells.reduce((nearest, cell) => {
+      currentSpatialData.cells.find((cell) => cellContainsPoint(cell, forecastPoint)) ||
+      currentSpatialData.cells.reduce((nearest, cell) => {
         const distance = (cell.lat - forecastPoint.lat) ** 2 + (cell.lng - forecastPoint.lng) ** 2;
         return !nearest || distance < nearest.distance ? { ...cell, distance } : nearest;
       }, null)
     );
-  }, [spatialData, forecastPoint]);
+  }, [currentSpatialData, forecastPoint]);
   const activeArea = activeCell || activeRegion;
   const regionalCategories = useMemo(() => regionalCategoryList(activeArea), [activeArea]);
   const weatherImpact = useMemo(
@@ -1777,6 +1785,8 @@ function App() {
     }
 
     const controller = new AbortController();
+    const requestBoundsKey = mapBoundsKey;
+    const requestZoomKey = mapZoomKey;
     const timeout = window.setTimeout(async () => {
       setSpatialLoading(true);
       setSpatialError('');
@@ -1786,7 +1796,7 @@ function App() {
           zoom: mapZoom,
           signal: controller.signal,
         });
-        setSpatialData(data);
+        setSpatialData({ ...data, boundsKey: requestBoundsKey, zoomKey: requestZoomKey });
       } catch (error) {
         if (error.name !== 'AbortError') {
           setSpatialError(error.message);
@@ -1812,6 +1822,7 @@ function App() {
     }
 
     const controller = new AbortController();
+    const requestBoundsKey = mapBoundsKey;
     const resumeAfterLoad = timelapsePlayingRef.current || forecastAutoplayPendingRef.current;
     if (resumeAfterLoad) {
       setTimelapsePlaying(false);
@@ -1828,7 +1839,7 @@ function App() {
           coverage: 'bounds',
           signal: controller.signal,
         });
-        setGridData(data);
+        setGridData({ ...data, boundsKey: requestBoundsKey });
       } catch (error) {
         if (error.name !== 'AbortError') {
           setGridError(error.message);
@@ -1962,7 +1973,7 @@ function App() {
         selectedCategoryData={selectedCategoryData}
         forecastMode={forecastMapReady}
         forecastCategory={forecastCategory}
-        gridData={gridData}
+        gridData={currentGridData}
         gridLoading={gridLoading}
         timeProgress={visualTimeOffset}
         weather={weather}
@@ -1970,7 +1981,7 @@ function App() {
         regionalLoading={regionalLoading}
         regionalError={regionalError}
         activeRegion={activeRegion}
-        spatialData={spatialData}
+        spatialData={currentSpatialData}
         spatialLoading={spatialLoading}
         spatialError={spatialError}
         activeCell={activeCell}
