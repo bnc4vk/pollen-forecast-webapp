@@ -553,7 +553,9 @@ function PollenMap({
   const gridIsFlatZero = gridIsCurrent && activeGridData && activeGridData.min === 0 && activeGridData.frameMax === 0;
   const hasEnsembleScore = Number(selectedCategoryData?.score) > 0;
   const hasForecastCells = Boolean(forecastMode && forecastGridData?.points?.length);
-  const hasVisibleLayer = Boolean(hasForecastCells || spatialData?.cells?.length || regionalData?.regions?.length);
+  const hasVisibleLayer = Boolean(
+    hasForecastCells || (!forecastMode && (spatialData?.cells?.length || regionalData?.regions?.length)),
+  );
   const regionalCategory = forecastMode ? forecastCategory : selectedCategory || 'aggregate';
 
   const centerOnUser = () => {
@@ -1120,6 +1122,8 @@ function PollenMap({
               ? 'Loading 11 km forecast tiles.'
               : forecastMode && forecastGridData
               ? `Showing ${forecastGridData.scaleLabel.toLowerCase()}s.`
+              : forecastMode
+                ? 'Preparing 11 km forecast tiles.'
               : spatialData
                 ? `Showing ${spatialData.scaleLabel.toLowerCase()} detail.`
                 : regionalData
@@ -1655,7 +1659,7 @@ function App() {
   const forecastPlaybackLoading = Boolean(
     forecastPlaybackActive && !gridError && (gridLoading || !forecastGridReady),
   );
-  const forecastMapReady = forecastGridReady;
+  const forecastModeActive = Boolean(forecastPlaybackActive && forecastAvailable && !gridError);
   const selectedCategoryData = forecast?.ensemble?.[selectedCategory];
   const activeRegion = useMemo(() => {
     if (!regionalData?.regions?.length || !forecastPoint) return null;
@@ -1764,6 +1768,7 @@ function App() {
 
   useEffect(() => {
     if (forecastPlaybackActive) {
+      setSpatialData(null);
       setSpatialLoading(false);
       setSpatialError('');
       return undefined;
@@ -1944,7 +1949,15 @@ function App() {
         categories={regionalCategories.length ? regionalCategories : forecast?.categories}
         selectedCategory={selectedCategory}
         onSelect={(category) => {
-          stopForecastPlayback();
+          if (forecastModeActive) {
+            const shouldResumePlayback = timelapsePlayingRef.current || forecastAutoplayPendingRef.current;
+            setTimelapsePlaying(false);
+            setForecastAutoplayPending(shouldResumePlayback);
+            setGridError('');
+            setVisualTimeOffset(0);
+          } else {
+            stopForecastPlayback();
+          }
           setSelectedCategory((selected) => (selected === category ? null : category));
         }}
       />
@@ -1960,7 +1973,7 @@ function App() {
         onZoomChange={setMapZoom}
         selectedCategory={selectedCategory}
         selectedCategoryData={selectedCategoryData}
-        forecastMode={forecastMapReady}
+        forecastMode={forecastModeActive}
         forecastCategory={forecastCategory}
         gridData={gridData}
         gridLoading={gridLoading}
@@ -2012,9 +2025,9 @@ function App() {
         loading={forecastLoading}
         error={forecastError || gridError}
         selectedCategory={selectedCategory}
-        regionalMode={!forecastMapReady}
+        regionalMode={!forecastModeActive}
         activeRegion={activeArea}
-        forecastMode={forecastMapReady}
+        forecastMode={forecastModeActive}
         forecastCategory={forecastCategory}
         forecastFrame={activeFrame}
         forecastProviders={FORECAST_PROVIDER_STATUSES}
